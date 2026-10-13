@@ -26,7 +26,6 @@
 	About VectorCraft	O aplikaci VectorCraft
 	Align to Path	Zarovnat k cestě
 	Cut Path at Selected Anchor Points	Rozdělit cestu ve vybraných kotevních bodech
-	Join Our Discord	Připojit se k našemu Discordu
 	Language	Jazyk
 	UI Brightness	Jas rozhraní
 	Dark	Tmavý
@@ -597,9 +596,7 @@
 	Save Swatch Library…	Uložit knihovnu vzorníku…
 	Symbol Libraries	Knihovny symbolů
 	Help	Nápověda
-	ArtCraft Website	Web ArtCraft
 	VectorCraft on getartcraft.com	VectorCraft na getartcraft.com
-	VectorCraft on GitHub	VectorCraft na GitHubu
 	Search Commands…	Hledat příkazy…
 	VectorCraft Help…	Nápověda VectorCraft…
 	Automatic	Automaticky
@@ -3302,7 +3299,6 @@ axis	Both	Obě
 	:	:
 effect	Regular	Pravidelný
 	Saving Poster.vectorcraft	Ukládání Poster.vectorcraft
-	Community	Komunita
 	Hide Bar	Skrýt panel
 	More Options	Další možnosti
 	Show Properties Panel	Zobrazit panel Vlastnosti

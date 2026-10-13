@@ -34,7 +34,7 @@ const OPTIONS: [(&str, &str, &str); 3] = [
     ("replace", "Replace", "Swap the selected object for the file, keeping its place and transform"),
 ];
 
-fn body(_: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
+fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
     let t = Tokens::get(ui.ctx());
     let files: Vec<Value> = d.fields.get("files").and_then(Value::as_array).cloned().unwrap_or_default();
     let info = d.fields.get("__info").cloned().unwrap_or_default();
@@ -73,7 +73,7 @@ fn body(_: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
         ui.spacing_mut().item_spacing.x = 18.0;
         for (key, label, tip) in OPTIONS {
             let on = d.bool(key);
-            let enabled = key != "replace" || d.bool("__replace");
+            let enabled = (key != "replace" || d.bool("__replace")) && (key != "link" || app.services.host_place_request.is_none());
             let tip = if key == "link" { link_tip(d) } else { tl!(tip).to_string() };
             if widgets::check_tip(ui, tl!(label), on && enabled, enabled, &tip) {
                 d.fields.insert(key.into(), json!(!on));

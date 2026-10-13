@@ -18,7 +18,6 @@ mod brand;
 pub mod canvas;
 pub mod chrome;
 mod clipboard_probe;
-pub mod community;
 pub mod control;
 pub mod credits;
 pub mod cursors;
@@ -187,6 +186,9 @@ pub type ReadFn = Box<dyn Fn(&str) -> Result<Vec<u8>, String>>;
 pub type WriteFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
 pub type Inbox = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 pub type DownloadFn = Box<dyn FnMut(&str, &[u8])>;
+pub type HostOpenedFn = Box<dyn Fn(u64, &Value)>;
+pub type HostPlaceFn = Box<dyn FnMut(u64, u64) -> Result<(), String>>;
+pub type HostSaveFn = Box<dyn FnMut(u64, u64, &str) -> Result<(), String>>;
 
 /// Opens a URL in the system browser.
 pub type OpenUrlFn = Box<dyn FnMut(&str)>;
@@ -197,6 +199,11 @@ pub type RevealFn = Box<dyn FnMut(&str) -> Result<(), String>>;
 /// Platform services injected by the host app (desktop or web).
 #[derive(Default)]
 pub struct Services {
+    /// A native open (including delayed import options) identifies the exact new document.
+    pub host_opened: Option<HostOpenedFn>,
+    pub host_place_request: Option<HostPlaceFn>,
+    /// FlashYun owns asynchronous Drive publication; native documents stay dirty until ACK.
+    pub host_save_request: Option<HostSaveFn>,
     /// Show an open dialog; returns a path.
     pub pick_open: Option<PickOpen>,
     /// Show a save dialog (suggested name, folder, file types); returns a path.
@@ -331,6 +338,8 @@ pub struct Perf {
 }
 
 pub struct VectorcraftApp {
+    pub host_saves: std::collections::BTreeSet<u64>,
+    pub host_pending_close: Option<(u64, String)>,
     pub session: Session,
     pub ui: UiState,
     pub views: Vec<View>,
@@ -451,6 +460,8 @@ impl VectorcraftApp {
         }
         let views = session.documents().iter().map(View::of).collect();
         Self {
+            host_saves: Default::default(),
+            host_pending_close: None,
             session,
             ui: UiState::default(),
             views,
@@ -884,6 +895,27 @@ impl VectorcraftApp {
     }
 
     /// Show a transient status message.
+    /// Host I/O state has the same lifetime as the native document tab.
+    pub fn retain_host_documents(&mut self) {
+        let docs = self.session.documents();
+        self.host_saves.retain(|uid| docs.iter().any(|doc| doc.uid == *uid));
+        if self.host_pending_close.as_ref().is_some_and(|(uid, _)| !docs.iter().any(|doc| doc.uid == *uid)) {
+            self.host_pending_close = None;
+        }
+    }
+
+    /// A close waiting for Save can continue only when the captured publication left it clean.
+    pub fn host_publication_completed(&mut self, uid: u64) {
+        self.host_saves.remove(&uid);
+        if self.host_pending_close.as_ref().is_some_and(|(id, _)| *id == uid)
+            && let Some(index) = self.session.documents().iter().position(|d| d.uid == uid && !d.is_dirty())
+            && let Some((_, then)) = self.host_pending_close.take()
+            && let Err(error) = crate::unsaved::resume_host_close(self, index, &then)
+        {
+            self.status(error);
+        }
+    }
+
     pub fn status(&mut self, s: impl Into<String>) {
         self.ui.status = s.into();
     }

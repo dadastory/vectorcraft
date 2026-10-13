@@ -222,7 +222,6 @@
 	Artboard {number}	Монтажна область {number}
 	Artboard:	Монтажна область:
 	Artboards	Монтажні області
-	ArtCraft Website	Веб-сайт ArtCraft
 	ArtCraft website	Веб-сайт ArtCraft
 	Artwork Colors	Кольори малюнка
 	As Multiple Assets	Як кілька ресурсів
@@ -466,7 +465,6 @@
 	Coming soon — tracked in the parity plan	Незабаром відстежується в плані розвитку
 	Command Click to Select Objects Behind	Cmd+клацання для вибору об’єктів позаду
 	Command Dialog	Діалогове вікно команди
-	Community	Спільнота
 	Compatibility:	Сумісність:
 	Compatible Gradient and Gradient Mesh Printing	Сумісний друк градієнтів та градієнтних сіток
 	Complement	Додатковий
@@ -1307,7 +1305,6 @@
 	Italian	Італійська
 	Japanese	Японська
 	Join	З’єднати
-	Join Our Discord	Приєднуйтесь до нашого Discord
 	Join our Discord	Приєднуйтесь до нашого Discord
 	Join the ArtCraft community on Discord (discord.gg/artcraft)	Приєднуйтесь до спільноти ArtCraft Discord (discord.gg/artcraft)
 	Join the lines of each paragraph	Поєднувати рядки кожного абзацу
@@ -3130,7 +3127,6 @@ effect	Points	Точки
 	VectorCraft didn't quit normally last time. These documents had unsaved changes:	VectorCraft не завершився нормально минулого разу. У цих документах були незбережені зміни:
 	VectorCraft Help…	Довідка VectorCraft…
 	VectorCraft on getartcraft.com	VectorCraft на getartcraft.com
-	VectorCraft on GitHub	VectorCraft на GitHub
 	Vectors	Вектори
 	Version {version} — open-source vector illustration in pure Rust.	Версія {version} — векторне малювання з відкритим кодом, написане на Rust.
 	Version:	Версія:

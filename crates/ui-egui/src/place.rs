@@ -132,6 +132,10 @@ pub fn run(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
 
 /// Pick files to place: the Place dialog opens with them (on the web once they arrive).
 fn pick(app: &mut VectorcraftApp) -> Result<(), String> {
+    if let Some(request) = app.services.host_place_request.as_mut() {
+        let st = app.session.active().ok_or("no document")?;
+        return request(st.uid, st.revision);
+    }
     if let Some(f) = app.services.place_async.as_mut() {
         f();
         return Ok(());
@@ -157,7 +161,7 @@ fn open_dialog(app: &mut VectorcraftApp, files: Vec<Value>) {
         crate::dialogs::place::KIND,
         json!({
             "files": files,
-            "link": app.ui.place_link,
+            "link": app.ui.place_link && app.services.host_place_request.is_none(),
             "template": false,
             "replace": false,
             "__replace": files.len() == 1 && one_object,
@@ -217,7 +221,7 @@ pub fn confirm(app: &mut VectorcraftApp, d: &crate::state::Dialog) -> Result<Val
     if sources.is_empty() {
         return Err("no files to place".into());
     }
-    let (link, template) = (d.bool("link"), d.bool("template"));
+    let (link, template) = (d.bool("link") && app.services.host_place_request.is_none(), d.bool("template"));
     app.ui.place_link = link;
     app.ui.dialog = None;
     let r = match &sources[..] {

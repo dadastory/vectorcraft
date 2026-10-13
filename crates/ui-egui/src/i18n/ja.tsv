@@ -45,7 +45,6 @@
 	Favorites	お気に入り
 	Flip	反転
 	Japanese	日本語
-	Join Our Discord	Discord に参加
 	Line-end Punctuation Half Width	行末約物半角
 	Mojikumi Set	文字組み
 	Kinsoku Set	禁則処理
@@ -644,9 +643,7 @@
 	Save Swatch Library…	スウォッチライブラリを保存…
 	Symbol Libraries	シンボルライブラリ
 	Help	ヘルプ
-	ArtCraft Website	ArtCraft の Web サイト
 	VectorCraft on getartcraft.com	getartcraft.com の VectorCraft
-	VectorCraft on GitHub	GitHub の VectorCraft
 	Search Commands…	コマンドを検索…
 	VectorCraft Help…	VectorCraft ヘルプ…
 	Preview	プレビュー
@@ -1001,7 +998,6 @@
 	Coming soon — tracked in the parity plan	近日対応予定
 	Command Click to Select Objects Behind	Command+クリックで背面のオブジェクトを選択
 	Command Dialog	コマンドダイアログ
-	Community	コミュニティ
 	Compatibility:	互換性:
 	Compatible Gradient and Gradient Mesh Printing	互換性のあるグラデーションとグラデーションメッシュのプリント
 	Complement	補色

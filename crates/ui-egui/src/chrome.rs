@@ -65,7 +65,6 @@ pub fn app_bar(app: &mut VectorcraftApp, ui: &mut Ui) {
             let icon = 28.0;
             let search = room >= 64.0 + 8.0 + gap + icon;
             let ws_w = ws_w.min(room - 8.0 - gap - if search { icon } else { 0.0 }).max(64.0);
-            let discord = search && room >= ws_w + 8.0 + gap + icon + 10.0 + gap + crate::community::discord_width(ui, false);
             let mut rui = ui.new_child(egui::UiBuilder::new().max_rect(right).layout(egui::Layout::right_to_left(egui::Align::Center)));
             let ui = &mut rui;
             // Workspace switcher: shows the current workspace, opens Window → Workspace.
@@ -86,10 +85,6 @@ pub fn app_bar(app: &mut VectorcraftApp, ui: &mut Ui) {
                     app.ui.palette_open = !app.ui.palette_open;
                     app.ui.palette_query.clear();
                 }
-            }
-            if discord {
-                ui.add_space(10.0);
-                crate::community::discord_button(app, ui, false);
             }
             if app.services.native_menu.is_some() {
                 let title = ui.painter().layout_no_wrap("VectorCraft".into(), egui::FontId::proportional(13.5), t.text);
@@ -1049,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn system_mode_hides_the_mark() {
+    fn host_branding_preserves_system_title_bar_modes() {
         for custom in [true, false] {
             let mut app = title_test_app(custom);
             app.run("file.new", json!({"width": 100, "height": 100, "name": "foo.svg"})).unwrap();
@@ -1058,18 +1053,9 @@ mod tests {
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| super::app_bar(&mut app, ui));
             let uploads = out.textures_delta.set.values().flat_map(|d| d.iter()).filter(|d| d.image.size() == [128, 128]).count();
             out.textures_delta.clear();
-            let marks: Vec<egui::Rect> = out
-                .shapes
-                .iter()
-                .filter_map(|c| match &c.shape {
-                    egui::Shape::Mesh(m) if m.texture_id == crate::brand::texture_id(&ctx) => Some(m.calc_bounds()),
-                    _ => None,
-                })
-                .collect();
             let system = super::system_title_bar(&app);
             assert_eq!(system, !custom && !cfg!(target_os = "macos"));
-            assert_eq!(marks.is_empty(), system, "mark in system mode (custom={custom})");
-            assert_eq!(uploads, if system { 0 } else { 1 }, "mark texture in system mode (custom={custom})");
+            assert_eq!(uploads, 0, "host-managed branding must not upload an upstream mark (custom={custom})");
         }
     }
 

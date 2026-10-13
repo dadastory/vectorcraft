@@ -210,7 +210,6 @@
 	Artboard {number}	Zeichenfläche {number}
 	Artboard:	Zeichenfläche:
 	Artboards	Zeichenflächen
-	ArtCraft Website	ArtCraft-Website
 	ArtCraft website	ArtCraft-Website
 	Artwork Colors	Farben der Grafik
 	As Multiple Assets	Als mehrere Assets
@@ -457,7 +456,6 @@
 	Coming soon — tracked in the parity plan	Demnächst verfügbar – im Paritätsplan vermerkt
 	Command Click to Select Objects Behind	Cmd-Klick wählt dahinterliegende Objekte aus
 	Command Dialog	Befehlsdialog
-	Community	Community
 	Compatibility:	Kompatibilität:
 	Compatible Gradient and Gradient Mesh Printing	Kompatibles Drucken von Verläufen und Verlaufsgittern
 	Complement	Komplementär
@@ -1295,7 +1293,6 @@
 	Italian	Italienisch
 	Japanese	Japanisch
 	Join	Zusammenfügen
-	Join Our Discord	Unserem Discord beitreten
 	Join our Discord	Unserem Discord beitreten
 	Join the ArtCraft community on Discord (discord.gg/artcraft)	Treten Sie der ArtCraft-Community auf Discord bei (discord.gg/artcraft)
 	Join the lines of each paragraph	Die Zeilen jedes Absatzes verbinden
@@ -3037,7 +3034,6 @@ effect	Points	Punkte
 	VectorCraft didn't quit normally last time. These documents had unsaved changes:	VectorCraft wurde beim letzten Mal nicht normal beendet. Diese Dokumente hatten ungespeicherte Änderungen:
 	VectorCraft Help…	VectorCraft-Hilfe…
 	VectorCraft on getartcraft.com	VectorCraft auf getartcraft.com
-	VectorCraft on GitHub	VectorCraft auf GitHub
 	Vectors	Vektoren
 	Version {version} — open-source vector illustration in pure Rust.	Version {version} – Open-Source-Vektorillustration in reinem Rust.
 	Version:	Version:

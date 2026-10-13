@@ -186,7 +186,6 @@
 	Artboard {number}	画板 {number}
 	Artboard:	画板：
 	Artboards	画板
-	ArtCraft Website	ArtCraft 网站
 	ArtCraft website	ArtCraft 网站
 	Artwork Colors	图稿颜色
 	As Multiple Assets	作为多个资源
@@ -431,7 +430,6 @@
 	Coming soon — tracked in the parity plan	即将推出 — 在对标计划中跟踪
 	Command Click to Select Objects Behind	按住 Command 单击选择后方对象
 	Command Dialog	命令对话框
-	Community	社区
 	Compatibility:	兼容性：
 	Compatible Gradient and Gradient Mesh Printing	兼容渐变和渐变网格打印
 	Complement	反选
@@ -1257,7 +1255,6 @@
 	Isolate Group	隔离编组
 	Italian	意大利语
 	Join	连接
-	Join Our Discord	加入 Discord
 	Join our Discord	加入我们的 Discord
 	Join the ArtCraft community on Discord (discord.gg/artcraft)	在 Discord 加入 ArtCraft 社区 (discord.gg/artcraft)
 	Join the lines of each paragraph	合并每个段落的行
@@ -3030,7 +3027,6 @@
 	VectorCraft didn't quit normally last time. These documents had unsaved changes:	VectorCraft 上次未正常退出。以下文档有未存储的更改：
 	VectorCraft Help…	VectorCraft 说明…
 	VectorCraft on getartcraft.com	getartcraft.com 上的 VectorCraft
-	VectorCraft on GitHub	GitHub 上的 VectorCraft
 	Vectors	矢量
 	Version {version} — open-source vector illustration in pure Rust.	版本 {version} — 以纯 Rust 打造的开放原始码矢量插画软件。
 	Version:	版本：

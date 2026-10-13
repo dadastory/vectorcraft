@@ -228,7 +228,6 @@
 	Artboard {number}	Tavola da disegno {number}
 	Artboard:	Tavola da disegno:
 	Artboards	Tavole da disegno
-	ArtCraft Website	Sito web di ArtCraft
 	ArtCraft website	Sito web di ArtCraft
 	Artwork Colors	Colori della grafica
 	As Multiple Assets	Come più risorse
@@ -472,7 +471,6 @@
 	Coming soon — tracked in the parity plan	Prossimamente — previsto nel piano di parità
 	Command Click to Select Objects Behind	Cmd+clic per selezionare gli oggetti retrostanti
 	Command Dialog	Finestra dei comandi
-	Community	Comunità
 	Compatibility:	Compatibilità:
 	Compatible Gradient and Gradient Mesh Printing	Stampa compatibile di sfumature e trame sfumatura
 	Complement	Complementare
@@ -1313,7 +1311,6 @@
 	Italian	Italiano
 	Japanese	Giapponese
 	Join	Unisci
-	Join Our Discord	Unisciti al nostro Discord
 	Join our Discord	Unisciti al nostro Discord
 	Join the ArtCraft community on Discord (discord.gg/artcraft)	Unisciti alla comunità di ArtCraft su Discord (discord.gg/artcraft)
 	Join the lines of each paragraph	Unisci le righe di ogni paragrafo
@@ -3137,7 +3134,6 @@
 	VectorCraft didn't quit normally last time. These documents had unsaved changes:	VectorCraft non si è chiuso correttamente l'ultima volta. Questi documenti avevano modifiche non salvate:
 	VectorCraft Help…	Aiuto di VectorCraft…
 	VectorCraft on getartcraft.com	VectorCraft su getartcraft.com
-	VectorCraft on GitHub	VectorCraft su GitHub
 	Vectors	Vettori
 	Version {version} — open-source vector illustration in pure Rust.	Versione {version} — illustrazione vettoriale open source in puro Rust.
 	Version:	Versione:

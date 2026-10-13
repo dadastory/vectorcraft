@@ -137,6 +137,8 @@ fn type_over_the_text_budget_keeps_its_entries_between_frames() {
     let d = text_doc(40, "Type");
     let opts = RenderOptions::default();
     let mut r = Renderer::new();
+    // Measure the complete fixture before imposing a budget; installed font sizes vary.
+    r.texts = FrameCache::new(usize::MAX, 1024);
     let want = r.render(&d, 400, 400, Affine::IDENTITY, &opts).pixels;
     assert_eq!(r.texts.len(), 40);
     let all = r.texts.bytes();

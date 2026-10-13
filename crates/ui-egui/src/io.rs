@@ -111,6 +111,11 @@ pub fn open_document(app: &mut VectorcraftApp, name: &str, bytes: &[u8], path: O
 /// A document just opened (`r`: `document.open`'s result): the views follow, the status bar says
 /// what didn't come in as it was, and missing links are asked about.
 pub(crate) fn opened(app: &mut VectorcraftApp, r: &Value) {
+    if let Some(opened) = app.services.host_opened.as_ref()
+        && let Some(document) = app.session.active()
+    {
+        opened(document.uid, r);
+    }
     app.sync_views();
     if let Some(w) = r["warnings"].as_array().filter(|w| !w.is_empty()) {
         app.status(format!("Opened with {} note(s): {}", w.len(), w[0].as_str().unwrap_or_default()));
@@ -324,6 +329,14 @@ fn plan(app: &VectorcraftApp, mode: SaveMode, p: &Value) -> Result<SavePlan, Str
 /// only), and so does Save As or Save a Copy to a given SVG path. → `{path, format, warnings…}` once written, or `{pending: <dialog kind>,
 /// path?}` while a dialog is open.
 pub fn save(app: &mut VectorcraftApp, mode: SaveMode, p: &Value, ask_options: bool) -> Result<Value, String> {
+    if let Some(request) = app.services.host_save_request.as_mut() {
+        let st = app.session.active().ok_or("no document")?;
+        if !app.host_saves.contains(&st.uid) {
+            request(st.uid, st.revision, mode.command())?;
+        }
+        return Ok(json!({"pending": "host-publication"}));
+    }
+
     remember_view(app);
     // Writing over the file the document was read from is asked about here, not refused.
     let first = plan(app, mode, &acknowledged(p))?;
@@ -551,6 +564,12 @@ pub fn recent_files(app: &VectorcraftApp) -> &[String] {
 /// document keeps its path. → `{path, warnings, files?}` (`files`: every file when there are
 /// several).
 pub fn export(app: &mut VectorcraftApp, format: Option<&str>, path: Option<String>, params: &Value) -> Result<Value, String> {
+    if let Some(request) = app.services.host_save_request.as_mut() {
+        let st = app.session.active().ok_or("no document")?;
+        request(st.uid, st.revision, "file.saveCopy")?;
+        return Ok(json!({"pending": "host-publication"}));
+    }
+
     let f = fileio::writable_format(format, path.as_deref())?;
     let st = app.session.active().ok_or("no document")?;
     let doc = match fileio::export_source(st, params).map_err(|e| e.to_string())? {

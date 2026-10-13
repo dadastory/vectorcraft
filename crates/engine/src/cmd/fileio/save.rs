@@ -260,7 +260,7 @@ fn is_svg(f: &Format) -> bool {
 
 /// The document as written: native files carry the view to reopen at and the Layers panel's open
 /// rows.
-fn doc_to_save(st: &DocState, f: &Format) -> Arc<Document> {
+pub fn doc_to_save(st: &DocState, f: &Format) -> Arc<Document> {
     if !is_native(f) {
         return st.doc.clone();
     }

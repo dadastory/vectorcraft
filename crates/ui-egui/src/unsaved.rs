@@ -95,6 +95,10 @@ pub fn confirm(app: &mut VectorcraftApp) -> Result<Value, String> {
         // A save that asks first (replacing a file that would lose what opening it left out) keeps
         // the document open: it closes once saved.
         if r.get("pending").is_some() {
+            if r["pending"] == "host-publication" {
+                let uid = app.session.documents().get(i).ok_or("no such document")?.uid;
+                app.host_pending_close = Some((uid, d.str("then")));
+            }
             return Ok(r);
         }
         // Closing needs the file written: wait for a background save, and stop if it failed.
@@ -107,6 +111,15 @@ pub fn confirm(app: &mut VectorcraftApp) -> Result<Value, String> {
     }
     close_now(app, i)?;
     match d.str("then").as_str() {
+        "close" => Ok(Value::Null),
+        then => close_all(app, then),
+    }
+}
+
+/// Resume a native close only after the host confirmed the exact published snapshot.
+pub(crate) fn resume_host_close(app: &mut VectorcraftApp, index: usize, then: &str) -> Result<Value, String> {
+    close_now(app, index)?;
+    match then {
         "close" => Ok(Value::Null),
         then => close_all(app, then),
     }

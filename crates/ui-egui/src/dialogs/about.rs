@@ -49,8 +49,6 @@ pub(super) fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
 fn about_tab(app: &mut VectorcraftApp, ui: &mut egui::Ui) {
     ui.set_width(380.0);
     ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
-        crate::brand::paint_mark(ui, r);
         ui.vertical(|ui| {
             ui.label(egui::RichText::new("VectorCraft").font(theme::semibold(22.0)));
             ui.label(crate::i18n::fmt(
@@ -59,8 +57,6 @@ fn about_tab(app: &mut VectorcraftApp, ui: &mut egui::Ui) {
             ));
         });
     });
-    ui.add_space(12.0);
-    crate::community::links(app, ui);
     ui.add_space(12.0);
     ui.label(
         egui::RichText::new(tl!(

@@ -41,11 +41,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn links() {
-        let mut s = Session::new();
-        assert_eq!(s.execute("help.discord", &json!({})).unwrap()["url"], "https://discord.gg/artcraft");
-        assert_eq!(s.execute("help.appPage", &json!({})).unwrap()["url"], "https://getartcraft.com/apps/vectorcraft");
-        assert_eq!(s.execute("help.github", &json!({})).unwrap()["url"], "https://github.com/storytold/vectorcraft");
-        assert_eq!(s.execute("help.links", &json!({})).unwrap()["website"], "https://getartcraft.com");
+    fn promotion_commands_are_not_registered() {
+        let mut session = Session::new();
+        for command in ["help.discord", "help.website", "help.appPage", "help.github", "help.links"] {
+            assert!(matches!(session.execute(command, &json!({})), Err(EngineError::UnknownCommand(id)) if id == command));
+        }
     }
 }
