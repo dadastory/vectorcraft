@@ -412,6 +412,29 @@ fn smooth_tool_reduces_jagged_path() {
     assert_eq!(p.subpaths[0].anchors[0].p, Point::new(100.0, 200.0));
 }
 
+/// #1512: a short drag over a small bump smooths the stretch of path under it. The long straight
+/// sides next to the bump stay straight lines from their far ends, which keep their place.
+#[test]
+fn a_short_smooth_drag_leaves_the_rest_of_long_segments_alone() {
+    let mut s = session();
+    let anchors: Vec<_> =
+        [(50.0, 200.0), (190.0, 200.0), (200.0, 192.0), (210.0, 200.0), (350.0, 200.0)].map(|(x, y)| json!({"x": x, "y": y})).to_vec();
+    let r = s.execute("path.create", &json!({"anchors": anchors})).unwrap();
+    let id = NodeId(r["id"].as_u64().unwrap());
+    let before = path(&s, id);
+    drag(&mut s, "smooth", &[(195.0, 194.0), (205.0, 194.0)], Mods::default());
+    let p = path(&s, id);
+    assert_ne!(p, before, "the bump is smoothed");
+    let a = &p.subpaths[0].anchors;
+    let (first, second, last) = (a[0], a[1], a[a.len() - 1]);
+    assert!(first.p == Point::new(50.0, 200.0) && !first.has_out() && !second.has_in(), "the left side is a line still: {first:?} {second:?}");
+    assert!(last.p == Point::new(350.0, 200.0) && !last.has_in() && !a[a.len() - 2].has_out(), "and the right one: {last:?}");
+    // Every other anchor is within the tool's reach of the drag (12 px either way).
+    for x in &a[1..a.len() - 1] {
+        assert!((182.0..=218.0).contains(&x.p.x) && (190.0..=201.0).contains(&x.p.y), "{x:?}");
+    }
+}
+
 #[test]
 fn join_tool_joins_two_lines() {
     let mut s = session();
@@ -1141,6 +1164,31 @@ fn the_pen_continues_any_open_path_and_joins_another() {
     assert_eq!(pts(&s, a), [(400.0, 200.0), (300.0, 200.0), (200.0, 100.0), (100.0, 100.0), (50.0, 50.0)]);
 }
 
+/// #1533: two corners of a rectangle brought together by Average become one anchor on Join, in
+/// one undo step; anchors that aren't on one another leave Join as it was.
+#[test]
+fn join_merges_the_selected_anchors_average_brought_together() {
+    let mut s = session();
+    let r = rect(&mut s, 100.0, 100.0, 100.0, 80.0);
+    let pts = |s: &Session| path(s, r).subpaths[0].anchors.iter().map(|x| (x.p.x, x.p.y)).collect::<Vec<_>>();
+    s.execute("select.anchors", &json!({"id": r.0, "anchors": [[0, 0], [0, 1]], "mode": "set"})).unwrap();
+    assert!(s.execute("path.join", &json!({})).is_err(), "apart: nothing to merge, and the path is closed");
+    s.execute("path.average", &json!({"axis": "both"})).unwrap();
+    s.execute("path.join", &json!({})).unwrap();
+    assert_eq!(pts(&s), [(150.0, 100.0), (200.0, 180.0), (100.0, 180.0)]);
+    assert!(path(&s, r).subpaths[0].closed);
+    let sel = &s.doc().unwrap().selection;
+    assert!(sel.objects == [r] && sel.anchors.is_empty());
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(pts(&s).len(), 4);
+    // The closing pair: the first and last anchors of a closed path.
+    s.execute("select.anchors", &json!({"id": r.0, "anchors": [[0, 0], [0, 3]], "mode": "set"})).unwrap();
+    s.execute("path.average", &json!({"axis": "both"})).unwrap();
+    let before = pts(&s);
+    s.execute("path.join", &json!({})).unwrap();
+    assert_eq!(pts(&s), before[..3]);
+}
+
 /// `path.join {ids, ends}` joins the ends asked for, not the nearest pair; bad requests are errors.
 #[test]
 fn join_takes_the_paths_and_the_ends_to_join() {
@@ -1186,4 +1234,22 @@ fn pen_with_alt_converts_the_anchors_of_a_path_in_a_selected_group() {
         assert_eq!((a.h_in, a.h_out), (Point::new(160.0, 90.0), Point::new(240.0, 110.0)), "{wrap}");
         assert_eq!(paths(&s).len(), 1, "{wrap}: no new path");
     }
+}
+
+/// #1679: a filled pencil path keeps a stroke of None; an unfilled one with no stroke gets black,
+/// or it would show nothing.
+#[test]
+fn a_filled_pencil_path_keeps_no_stroke() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 200, "height": 200})).unwrap();
+    s.execute("select.none", &json!({})).unwrap();
+    s.execute("paint.setFill", &json!({"color": "#ff0000"})).unwrap();
+    s.execute("paint.setStroke", &json!({"none": true})).unwrap();
+    let pts = json!([[10, 10], [60, 20], [90, 80], [20, 90]]);
+    let id = NodeId(s.execute("path.freehand", &json!({"points": pts, "fill": true})).unwrap()["id"].as_u64().unwrap());
+    let n = s.doc().unwrap().doc.node(id).unwrap().clone();
+    assert!(n.appearance.stroke_paint().is_none(), "{:?}", n.appearance);
+    assert!(!n.appearance.fill_paint().is_none());
+    let id = NodeId(s.execute("path.freehand", &json!({"points": pts})).unwrap()["id"].as_u64().unwrap());
+    assert!(!s.doc().unwrap().doc.node(id).unwrap().appearance.stroke_paint().is_none());
 }

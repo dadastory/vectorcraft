@@ -215,6 +215,7 @@
 	Author Title:	作者職稱：
 	Author:	作者：
 	Auto	自動
+	Auto Color	自動顏色
 	Automatic	自動
 	Auto Size New Area Type	自動調整新區域文字大小
 	Auto Spell Check	自動拼字檢查
@@ -340,6 +341,59 @@
 	Character Style Options	字元樣式選項
 	Character Styles	字元樣式
 	Check Links	檢查連結
+# Check Script (File › Scripts) and the report it shows on a script written for the reference app.
+	Check Script	檢查指令碼
+	Check Script…	檢查指令碼…
+	Copy Report	複製報告
+	VectorCraft read this script without running it.	VectorCraft 已讀取此指令碼，但沒有執行。
+	Needs nothing beyond plain JavaScript	只需要一般的 JavaScript
+	Needs the script language's own objects or directives	需要指令碼語言本身的物件或指示詞
+	Needs the document model	需要文件模型
+	Needs files	需要檔案
+	Needs menu commands	需要選單指令
+	Needs dialogs	需要對話框
+	Needs features only the reference app has	需要只有參考應用程式才有的功能
+	Outside the document	文件以外
+	Writes, moves or deletes files	寫入、移動或刪除檔案
+	Opens files in other apps	在其他應用程式中開啟檔案
+	Opens network connections	開啟網路連線
+	Loads native code	載入原生程式碼
+	Sends messages to other apps	傳送訊息給其他應用程式
+	Reads or sets environment variables	讀取或設定環境變數
+	Runs code the checker can't read	執行檢查無法讀取的程式碼
+	Changes the reference app's preferences	變更參考應用程式的偏好設定
+	Menu commands	選單指令
+	Names the script builds as it runs: {count}	指令碼在執行時組成的名稱：{count}
+	Document model	文件模型
+	Object types: {names}	物件類型：{names}
+	Directives	指示詞
+	Includes	引入的檔案
+	Checked	已檢查
+	Not followed: outside the script's folder	已略過：在指令碼資料夾以外
+	Includes itself	引入自身
+	Not read	未讀取
+	Not read: a limit was reached	未讀取：已達上限
+	Compiled or not text	已編譯或不是文字
+	Problems	問題
+	String not closed	字串未結束
+	Comment not closed	註解未結束
+	Regular expression not closed	規則運算式未結束
+	Template literal not closed	樣板字面值未結束
+	XML literal not closed	XML 字面值未結束
+	Bracket never closed	括號未關閉
+	Closing bracket with no opening one	結束括號沒有對應的開始括號
+	Syntax newer than ES3	比 ES3 更新的語法
+	Unknown directive	不明的指示詞
+	Not valid UTF-8: unreadable bytes were replaced	不是有效的 UTF-8：無法讀取的位元組已被取代
+	Mixed line endings	換行字元混用
+	Nesting too deep to follow	巢狀層次太深，無法追蹤
+	line {line}	第 {line} 行
+	lines {lines}	第 {lines} 行
+	{file}, line {line}	{file}，第 {line} 行
+	Compiled script: ask its author for the .jsx file	已編譯的指令碼：請向作者索取 .jsx 檔案
+	Too large to check	太大，無法檢查
+	Not a script for the reference app	不是參考應用程式的指令碼
+	Some lists were cut short at their limit.	部分清單已在上限處截斷。
 	Check Spelling…	拼字檢查…
 	Choose a folder	選擇資料夾
 	Choose…	選擇…
@@ -685,6 +739,8 @@
 	Do Not Move	不移動
 	Do you want to save the changes you made to “{name}”?	要儲存對「{name}」所做的變更嗎？
 	Can't open “{name}”.	無法開啟「{name}」。
+	Can't save “{name}”.	無法儲存「{name}」。
+	Can't export “{name}”.	無法匯出「{name}」。
 	Document	文件
 	Document Color Mode	文件色彩模式
 	Document Info	文件資訊
@@ -1116,6 +1172,8 @@
 	Graphic Style Library	繪圖樣式資料庫
 	Graphic Style Options	繪圖樣式選項
 	Graphic Style Options…	繪圖樣式選項…
+	Symbol Options	符號選項
+	Symbol Options…	符號選項…
 	Graphic Styles	繪圖樣式
 	Graphic Styles Options	繪圖樣式選項
 	Graphics	圖形
@@ -1217,6 +1275,9 @@
 	Identify Objects By	識別物件依據
 	Ignore	略過
 	Ignore Artboards (all the art as one page)	忽略工作區域 (所有圖稿視為單一頁面)
+	Auto Grouping	自動群組
+	Enhanced	增強
+	Ignore Color	忽略顏色
 	Ignore White	忽略白色
 	Palette:	調色盤：
 	Limited	有限
@@ -1308,6 +1369,44 @@
 	Keyboard Shortcut Conflicts	鍵盤快速鍵衝突
 	Keyboard Shortcut Set	鍵盤快速鍵組
 	Keyboard Shortcuts…	鍵盤快速鍵…
+# Import Shortcut Set (Keyboard Shortcuts › Import…, File › Open of a .kys file) and its commands.
+	Import Shortcut Set	匯入快速鍵組
+	Import Shortcut Set…	匯入快速鍵組…
+	Each entry of the file is matched to a VectorCraft tool, command or panel. Check the matches and answer what is left.	檔案中的每個項目都會對應到 VectorCraft 的工具、指令或面板。請檢查對應結果，並回答其餘項目。
+	Keys	按鍵
+	The file writes keys and modifiers as codes. Check the proposed meanings and answer the codes that are not known yet.	檔案以代碼記錄按鍵與輔助鍵。請檢查建議的意義，並回答尚未得知的代碼。
+	Click, then press the key this code stands for (Esc cancels)	按一下，然後按下此代碼代表的按鍵 (Esc 取消)
+	Press a key…	請按下按鍵…
+	from your earlier imports	依據您先前的匯入
+	from the format's public description	依據格式的公開說明
+	not known yet	尚未得知
+	Shortcuts	快速鍵
+	Shortcut	快速鍵
+	In the File	檔案中的名稱
+	In VectorCraft	VectorCraft 中的對應
+	Needs Attention Only	僅顯示需要處理的項目
+	Ready	就緒
+	Needs a choice	需要選擇
+	Needs a key	需要按鍵
+	No equivalent	沒有對應項目
+	Tools take a single key (optionally with Shift)	工具只能指定單一按鍵 (可搭配 Shift)
+	A later row takes this shortcut	後面的列會使用此快速鍵
+	Same item as a later row	與後面某一列的項目相同
+	Start from VectorCraft Defaults	從 VectorCraft 預設值開始
+	Add to the Current Shortcuts	加入目前的快速鍵
+	Remember My Choices	記住我的選擇
+	{ready} of {total} ready	{total} 個中有 {ready} 個就緒
+	The file is too large to read in full, so only its first part is listed.	檔案太大，無法完整讀取，因此只列出開頭的部分。
+	Report copied	已複製報告
+	Line {line}	第 {line} 行
+	Line {line}: {name}: {status}	第 {line} 行：{name}：{status}
+	Imported. Press OK to keep the imported set.	已匯入。按一下「確定」以保留匯入的快速鍵組。
+	Read Shortcut Set File	讀取快速鍵組檔案
+	Import Matches	匯入對應
+	Remember Import Matches	記住匯入對應
+	Forget Import Matches	清除匯入對應
+@plural	agrees with {n} default shortcut|agrees with {n} default shortcuts	與 {n} 個預設快速鍵一致
+@plural	{n} part of the file wasn't read|{n} parts of the file weren't read	檔案中有 {n} 個部分未讀取
 	Keywords:	關鍵字：
 	Knife	美工刀
 	Knockout Group	去底群組
@@ -2691,6 +2790,7 @@
 	Snap to Glyph	靠齊字符
 	Snap to Grid	靠齊格點
 	Snap to Pixel	靠齊像素
+	Precise Cursors	精確游標
 	Snap to Point	靠齊控制點
 	Snapping Tolerance	靠齊容許度
 	Social Square Post 1080×1080	社群正方形貼文 1080×1080
@@ -2716,6 +2816,8 @@
 	Spiral Tool	螺旋工具
 	Split Freeform Line	分割任意形狀線條
 	Split Into Grid	分割為格線
+	Total:	總計：
+	Add Guides	增加參考線
 	Split Into Grid…	分割為格線…
 	Split Path	分割路徑
 	spot	特別色
@@ -3216,6 +3318,7 @@
 	{warning}: click to correct to the closest color ({hex})	{warning}：按一下以修正為最接近的顏色 ({hex})
 	“{file}” is protected by a password.	「{file}」受密碼保護。
 	● Recording	● 錄製中
+imageTrace	Outline	輪廓
 @plural	{n} item|{n} items	{n} 個項目
 @plural	Color Table ({n} color)|Color Table ({n} colors)	色彩表 ({n} 色)
 @plural	Delete this {n} graphic style?|Delete these {n} graphic styles?	要刪除這 {n} 個繪圖樣式嗎？
@@ -3511,9 +3614,6 @@ effect	Soft	柔和
 	Rotation Y	Y 軸旋轉
 	Rotation Z	Z 軸旋轉
 	Shading	明暗處理
-	Direction	方向
-	Elevation	仰角
-	Ambient	環境光
 	Segments	分段數
 	Show axis	顯示軸
 	Reset all	全部重設
@@ -3574,3 +3674,66 @@ lighting	Light	光源
 	Use Outside Rectangle As Frame	使用外部矩形作為框架
 	Create Compound Path From Ellipses	從橢圓形建立複合路徑
 	Fill Grid	格線填色
+	Select two or more objects, or a group	請選取兩個或更多物件，或一個群組
+# 3D and Materials › Extrude & Bevel, Inflate and Rotate: options, Position presets and bevel shapes.
+	Back	背面
+	Both sides	雙面
+	Classic	經典
+	Cove	凹圓
+	Depth	深度
+	Front	正面
+	Isometric Bottom	等角底部
+	Isometric Left	等角左側
+	Isometric Right	等角右側
+	Isometric Top	等角頂部
+	Off-Axis Back	離軸背面
+	Off-Axis Bottom	離軸底部
+	Off-Axis Front	離軸正面
+	Off-Axis Left	離軸左側
+	Off-Axis Right	離軸右側
+	Off-Axis Top	離軸頂部
+	Ogee	反曲線
+	Reset all 3D settings to their defaults.	將所有 3D 設定重設為預設值。
+	Step	階梯
+	Taper	錐化
+	Twist	扭轉
+	Volume	體積
+3d	Cap	封口
+3d	Solid	實心
+3d	Hollow	空心
+3d	Bevel	斜角
+3d	Rounded	圓角
+3d	Space	間距
+	Bevel Shape	斜角形狀
+	Bevel Inside	斜角向內
+	Bevel both sides	雙面斜角
+	Presets	預設集
+@msg	An object takes one 3D effect. Edit the existing effect's options, or remove it first.	一個物件只能套用一種 3D 效果。請編輯現有效果的選項，或先將其移除。
+@msg	{label} currently requires a path or compound path. Convert type, images and groups to paths first.	{label}目前需要路徑或複合路徑。請先將文字、影像和群組轉換為路徑。
+@msg	{label} requires a shape with at least two anchors	{label}需要至少有兩個錨點的形狀
+@msg	The shape is too complex for a 3D effect	形狀過於複雜，無法套用 3D 效果
+@msg	The 3D surface is too complex; simplify the shape	3D 表面過於複雜；請簡化形狀
+	Transform Objects	變形物件
+@msg	unknown parameter `{key}`; did you mean `{near}`?	未知的參數 `{key}`；您是指 `{near}` 嗎？
+@msg	unknown parameter `{key}`; the command takes no parameters	未知的參數 `{key}`；此指令沒有參數
+@msg	unknown parameter `{key}`; the command takes: {keys}	未知的參數 `{key}`；此指令接受：{keys}
+	Load EPS into Clipboard	將 EPS 載入剪貼簿
+@msg	an image of {w} × {h} pixels is too large to draw	{w} × {h} 像素的影像過大，無法繪製
+	Basic	基本
+	Fill and Stroke Controls	填色和筆畫控制項
+	Coloring Controls	顏色控制項
+	Draw Mode Controls	繪圖模式控制項
+	Screen Mode Controls	螢幕模式控制項
+	Drawer menu	抽屜選單
+	Toolbar: Show Controls	工具列：顯示控制項
+@msg	control must be fillStroke, coloring, drawMode or screenMode	control 必須是 fillStroke、coloring、drawMode 或 screenMode
+@msg	unknown control `{name}`: fillStroke, coloring, drawMode or screenMode	未知控制項 `{name}`：fillStroke、coloring、drawMode 或 screenMode
+# Corner Radius: a field per corner of a live rectangle.
+	Single Corner Radius	統一圓角半徑
+	Top Left:	左上：
+	Top Right:	右上：
+	Bottom Left:	左下：
+	Bottom Right:	右下：
+	Softness	柔和度
+	Ambient Light	環境光
+	Light behind the object	光源位於物件後方

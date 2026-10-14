@@ -52,7 +52,7 @@ mod new_document;
 pub mod new_swatch;
 pub mod office_export;
 pub mod package;
-mod path_ops;
+pub(crate) mod path_ops;
 pub mod pdf_presets;
 pub mod perspective_grid;
 pub mod perspective_options;
@@ -78,12 +78,15 @@ pub(crate) mod save_options;
 mod save_pdf;
 pub mod save_style_library;
 pub mod save_swatch_library;
+pub mod script_check;
 mod shapes;
+pub mod shortcut_import;
 pub mod slices;
 pub mod spot_colors;
 pub(crate) mod svg_options;
 pub mod swatch_conflict;
 pub mod swatch_options;
+pub mod symbol_options;
 pub mod symbolism_options;
 mod text_export;
 pub mod text_import;
@@ -104,7 +107,8 @@ pub use effect::open as open_effect_dialog;
 pub use export_as::open as open_export_as;
 pub use export_for_screens::open as open_export_for_screens;
 pub(crate) use export_for_screens::{
-    KIND as EXPORT_FOR_SCREENS, formats as screen_formats, open_assets as open_export_for_screens_assets, saved_rows as screen_saved_rows,
+    KIND as EXPORT_FOR_SCREENS, formats as screen_formats, open_assets as open_export_for_screens_assets, saved_options as screen_saved_options,
+    saved_rows as screen_saved_rows,
 };
 pub(crate) use new_document::preset_name;
 pub use new_document::{open as open_new_document, preset_card};
@@ -284,12 +288,14 @@ registry! {
     PrintPreset: [print::PRESET_KIND] => print::PRESET_SPEC,
     PrintPresets: [print_presets::KIND] => print_presets::SPEC,
     Plugin: [plugin::KIND] => plugin::SPEC,
+    ScriptCheck: [script_check::KIND] => script_check::SPEC,
     VectorHalftone: [halftone::KIND] => halftone::SPEC,
     PerspectiveGrid: [perspective_grid::KIND] => perspective_grid::SPEC,
     Envelope: [envelope::WARP, envelope::MESH, envelope::OPTIONS] => envelope::SPEC,
     LiquifyOptions: [liquify::KIND] => liquify::SPEC,
     FreehandOptions: [freehand::KIND] => freehand::SPEC,
     FlareOptions: [flare_options::KIND] => flare_options::SPEC,
+    SymbolOptions: [symbol_options::KIND] => symbol_options::SPEC,
     SymbolismOptions: [symbolism_options::KIND] => symbolism_options::SPEC,
     PerspectiveGridPresets: [perspective_presets::KIND] => perspective_presets::SPEC,
     PerspectiveGridOptions: [perspective_options::KIND] => perspective_options::SPEC,
@@ -300,6 +306,7 @@ registry! {
     LayerOptions: [layer_options::KIND] => layer_options::SPEC,
     LayersPanelOptions: [layers_panel_options::KIND] => layers_panel_options::SPEC,
     RearrangeArtboards: [rearrange_artboards::KIND] => rearrange_artboards::SPEC,
+    ShortcutImport: [shortcut_import::KIND] => DialogSpec::window(shortcut_import::show, shortcut_import::confirm),
 }
 
 /// The button labels the shared dialog frame can show (OK, discard and the fixed Cancel/Close),
@@ -328,11 +335,24 @@ fn run_and_close(app: &mut VectorcraftApp, id: &str, params: Value) -> DialogRes
     r
 }
 
-/// Close the open dialog as Cancel does, rolling back a live preview (`ui.dialog.cancel`).
+/// The field of a dialog opened over another (Import Shortcut Set over Keyboard Shortcuts) that
+/// holds the dialog under it, which Cancel and Escape show again.
+pub(crate) const PARENT: &str = "__parent";
+
+/// The dialog `d` was opened over, as it was.
+pub(crate) fn parent(d: &Dialog) -> Option<Dialog> {
+    d.fields.get(PARENT).and_then(|v| serde::Deserialize::deserialize(v).ok())
+}
+
+/// Close the open dialog as Cancel does, rolling back a live preview and showing the dialog it was
+/// opened over (`ui.dialog.cancel`).
 pub fn cancel(app: &mut VectorcraftApp) {
     missing_fonts::requeue_replaced(app);
-    if app.ui.dialog.take().is_some_and(|d| spec(&d.kind).preview) {
-        let _ = app.session.cancel_interaction();
+    if let Some(d) = app.ui.dialog.take() {
+        if spec(&d.kind).preview {
+            let _ = app.session.cancel_interaction();
+        }
+        app.ui.dialog = parent(&d);
     }
     settle(app);
 }
@@ -361,6 +381,7 @@ pub(crate) fn settle(app: &mut VectorcraftApp) {
 pub fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
     about::show(app, ctx);
     settle(app);
+    confirm::show_waiting(app);
     // The kind of dialog shown last frame: a different one (or none) means this one just opened, and
     // its first field is to take the keyboard focus (`focus_id`, until a field takes it).
     let (shown_id, focus_id) = (egui::Id::new("dialog-shown"), egui::Id::new("dialog-focus-pending"));
@@ -535,3 +556,6 @@ mod tests_modal;
 
 #[cfg(test)]
 mod tests_rectangular_grid;
+
+#[cfg(test)]
+mod tests_shortcut_import;

@@ -513,6 +513,7 @@
 	Three Point Perspective	3 点遠近法
 	Save Grid as Preset…	グリッドをプリセットとして保存…
 	Snap to Pixel	ピクセルにスナップ
+	Precise Cursors	精密カーソル
 	Snap to Point	ポイントにスナップ
 	Snap to Glyph	グリフにスナップ
 	New View…	新規表示…
@@ -663,6 +664,7 @@
 	Hide Print Tiling	プリント分割を隠す
 	Unlock Grid	グリッドをロック解除
 	Edit Envelope	エンベロープを編集
+	Auto Color	自動カラー
 	Automatic	自動
 	Isolate Selected Group	選択したグループを分離
 	Exit Isolation Mode	分離モードを終了
@@ -933,6 +935,59 @@
 	Character Set:	文字セット:
 	Character Style Options	文字スタイルオプション
 	Check Links	リンクを確認
+# Check Script (File › Scripts) and the report it shows on a script written for the reference app.
+	Check Script	スクリプトをチェック
+	Check Script…	スクリプトをチェック…
+	Copy Report	レポートをコピー
+	VectorCraft read this script without running it.	VectorCraft はこのスクリプトを実行せずに読み取りました。
+	Needs nothing beyond plain JavaScript	通常の JavaScript 以外は不要
+	Needs the script language's own objects or directives	スクリプト言語固有のオブジェクトまたはディレクティブが必要
+	Needs the document model	ドキュメントモデルが必要
+	Needs files	ファイルが必要
+	Needs menu commands	メニューコマンドが必要
+	Needs dialogs	ダイアログが必要
+	Needs features only the reference app has	参照アプリだけにある機能が必要
+	Outside the document	ドキュメントの外
+	Writes, moves or deletes files	ファイルを書き込み、移動、削除
+	Opens files in other apps	ほかのアプリでファイルを開く
+	Opens network connections	ネットワーク接続を開く
+	Loads native code	ネイティブコードを読み込む
+	Sends messages to other apps	ほかのアプリにメッセージを送る
+	Reads or sets environment variables	環境変数を読み取りまたは設定
+	Runs code the checker can't read	チェックで読み取れないコードを実行
+	Changes the reference app's preferences	参照アプリの環境設定を変更
+	Menu commands	メニューコマンド
+	Names the script builds as it runs: {count}	スクリプトが実行時に組み立てる名前：{count}
+	Document model	ドキュメントモデル
+	Object types: {names}	オブジェクトの種類：{names}
+	Directives	ディレクティブ
+	Includes	インクルード
+	Checked	チェック済み
+	Not followed: outside the script's folder	読み込み対象外：スクリプトのフォルダーの外
+	Includes itself	自身をインクルードしています
+	Not read	読み込んでいません
+	Not read: a limit was reached	読み込んでいません：上限に達しました
+	Compiled or not text	コンパイル済みかテキストではありません
+	Problems	問題
+	String not closed	文字列が閉じていません
+	Comment not closed	コメントが閉じていません
+	Regular expression not closed	正規表現が閉じていません
+	Template literal not closed	テンプレートリテラルが閉じていません
+	XML literal not closed	XML リテラルが閉じていません
+	Bracket never closed	括弧が閉じていません
+	Closing bracket with no opening one	対応する開き括弧のない閉じ括弧
+	Syntax newer than ES3	ES3 より新しい構文
+	Unknown directive	不明なディレクティブ
+	Not valid UTF-8: unreadable bytes were replaced	有効な UTF-8 ではありません：読み取れないバイトを置き換えました
+	Mixed line endings	改行コードが混在しています
+	Nesting too deep to follow	入れ子が深すぎてたどれません
+	line {line}	{line} 行目
+	lines {lines}	{lines} 行目
+	{file}, line {line}	{file}、{line} 行目
+	Compiled script: ask its author for the .jsx file	コンパイル済みスクリプト：作成者に .jsx ファイルを依頼してください
+	Too large to check	大きすぎてチェックできません
+	Not a script for the reference app	参照アプリ用のスクリプトではありません
+	Some lists were cut short at their limit.	一部の一覧は上限で打ち切られました。
 	Choose a folder	フォルダーを選択
 	Choose…	選択…
 	Circle	円
@@ -1164,6 +1219,8 @@
 	Divide Vertically Into	垂直方向に分割
 	Do you want to save the changes you made to “{name}”?	「{name}」への変更を保存しますか？
 	Can't open “{name}”.	「{name}」を開けません。
+	Can't save “{name}”.	「{name}」を保存できません。
+	Can't export “{name}”.	「{name}」を書き出せません。
 	Document	ドキュメント
 	Document Ink Options	ドキュメントのインキオプション
 	Document JSON	ドキュメント JSON
@@ -1417,6 +1474,8 @@
 	Graphic Style Library	グラフィックスタイルライブラリ
 	Graphic Style Options	グラフィックスタイルオプション
 	Graphic Style Options…	グラフィックスタイルオプション…
+	Symbol Options	シンボルオプション
+	Symbol Options…	シンボルオプション…
 	Graphic Styles Options	グラフィックスタイルオプション
 	Graphics Processor	グラフィックプロセッサー
 	Graphics: {adapter}	グラフィックス: {adapter}
@@ -1477,6 +1536,9 @@
 	Identify Objects By	オブジェクトの識別方法
 	Ignore	無視
 	Ignore Artboards (all the art as one page)	アートボードを無視 (すべてのアートを 1 ページとして扱う)
+	Auto Grouping	自動グループ化
+	Enhanced	拡張
+	Ignore Color	カラーを無視
 	Ignore White	白を無視
 	Palette:	パレット:
 	Limited	限定
@@ -1537,6 +1599,44 @@
 	Keyboard Increment	キー入力
 	Keyboard Shortcut Conflicts	キーボードショートカットの競合
 	Keyboard Shortcut Set	キーボードショートカットセット
+# Import Shortcut Set (Keyboard Shortcuts › Import…, File › Open of a .kys file) and its commands.
+	Import Shortcut Set	ショートカットセットを読み込み
+	Import Shortcut Set…	ショートカットセットを読み込み…
+	Each entry of the file is matched to a VectorCraft tool, command or panel. Check the matches and answer what is left.	ファイルの各項目を VectorCraft のツール、コマンド、パネルに対応付けます。対応を確認して、残りの項目を指定してください。
+	Keys	キー
+	The file writes keys and modifiers as codes. Check the proposed meanings and answer the codes that are not known yet.	このファイルはキーと修飾キーをコードで記録しています。提案された意味を確認して、まだ分からないコードを指定してください。
+	Click, then press the key this code stands for (Esc cancels)	クリックしてから、このコードが表すキーを押します (Esc でキャンセル)
+	Press a key…	キーを押してください…
+	from your earlier imports	以前の読み込みより
+	from the format's public description	形式の公開されている説明より
+	not known yet	未確定
+	Shortcuts	ショートカット
+	Shortcut	ショートカット
+	In the File	ファイル内の名前
+	In VectorCraft	VectorCraft での対応
+	Needs Attention Only	要確認の行のみ
+	Ready	適用可能
+	Needs a choice	選択が必要
+	Needs a key	キーが必要
+	No equivalent	対応なし
+	Tools take a single key (optionally with Shift)	ツールには 1 つのキーのみ割り当てられます (Shift との組み合わせは可)
+	A later row takes this shortcut	後の行がこのショートカットを使用
+	Same item as a later row	後の行と同じ項目
+	Start from VectorCraft Defaults	VectorCraft の初期設定から開始
+	Add to the Current Shortcuts	現在のショートカットに追加
+	Remember My Choices	選択内容を記憶
+	{ready} of {total} ready	{total} 件中 {ready} 件が適用可能
+	The file is too large to read in full, so only its first part is listed.	ファイルが大きすぎて全体を読み込めないため、最初の部分のみを表示しています。
+	Report copied	レポートをコピーしました
+	Line {line}	{line} 行目
+	Line {line}: {name}: {status}	{line} 行目: {name}: {status}
+	Imported. Press OK to keep the imported set.	読み込みました。読み込んだセットを保持するには OK を押してください。
+	Read Shortcut Set File	ショートカットセットファイルを読む
+	Import Matches	読み込み時の対応付け
+	Remember Import Matches	読み込み時の対応付けを記憶
+	Forget Import Matches	読み込み時の対応付けを消去
+@plural	agrees with {n} default shortcut|agrees with {n} default shortcuts	{n} 個の初期設定ショートカットと一致
+@plural	{n} part of the file wasn't read|{n} parts of the file weren't read	ファイルの {n} 箇所を読み込めませんでした
 	Keywords:	キーワード:
 	Knife	ナイフ
 	Knockout Group	グループの抜き
@@ -2518,6 +2618,8 @@
 	Spiral Tool	スパイラルツール
 	Split Freeform Line	フリーフォームラインを分割
 	Split Into Grid	グリッドに分割
+	Total:	合計:
+	Add Guides	ガイドを追加
 	Split Path	パスを分割
 	Spot Color	特色
 	Spot Colors	特色
@@ -3219,6 +3321,7 @@
 	Yellow	イエロー
 	[Normal Character Style]	[標準文字スタイル]
 	[Normal Paragraph Style]	[標準段落スタイル]
+imageTrace	Outline	アウトライン
 @plural	Color Table ({n} color)|Color Table ({n} colors)	カラーテーブル ({n} 色)
 @plural	Delete this {n} graphic style?|Delete these {n} graphic styles?	{n} 個のグラフィックスタイルを削除しますか？
 @plural	{n} Layer|{n} Layers	{n} レイヤー
@@ -3546,6 +3649,7 @@ theme	Appearance	外観
 @msg	the layer to flatten into is hidden	統合先のレイヤーが非表示になっています
 @msg	there are no objects to release	レイヤーに分配するオブジェクトがありません
 @msg	no library `{id}`	ライブラリ `{id}` が見つかりません
+@msg	{path}: not a file	{path}: ファイルではありません
 @msg	{path}: {e}	{path}: {e}
 @msg	can't write .{ext} images	.{ext} 画像は書き出せません
 @msg	Replace Spine: select a blend and a path	ブレンド軸を置き換え: ブレンドとパスを選択してください
@@ -3586,6 +3690,7 @@ theme	Appearance	外観
 @msg	Divide Objects Below: select a path	背面のオブジェクトで型抜き: パスを選択してください
 @msg	Divide Objects Below: select exactly one path	背面のオブジェクトで型抜き: パスを 1 つだけ選択してください
 @msg	Offset Path: select paths	パスのオフセット: パスを選択してください
+@msg	Offset Path: the offset leaves nothing of the selected paths (an inset larger than the shapes)	パスのオフセット: オフセットすると選択したパスが何も残りません (内側へのオフセットがシェイプより大きい)
 @msg	Outline Stroke: no stroked paths selected	パスのアウトライン: 線のあるパスが選択されていません
 @msg	Split Into Grid: select paths large enough for the grid	グリッドに分割: グリッドが収まる大きさのパスを選択してください
 @msg	empty cutter	型抜きに使うパスが空です
@@ -3661,6 +3766,8 @@ theme	Appearance	外観
 @msg	no interaction in progress	進行中の操作がありません
 @msg	no such object {0}	オブジェクト {0} が見つかりません
 @msg	result would exceed the canvas (coordinates out of range)	結果がカンバスの範囲を超えます (座標が範囲外です)
+@msg	objects can't be nested more than 32 deep	オブジェクトは 32 階層より深く入れ子にできません
+@msg	the SVG's elements are nested more than {0} deep	SVG の要素が {0} 階層より深く入れ子になっています
 @msg	unknown command `{0}`	`{0}` は不明なコマンドです
 @msg	`{what}` closes nothing	`{what}` に対応する開始部分がありません
 @msg	`{what}` closes something it didn't open	`{what}` が対応しない開始部分を閉じています
@@ -3701,6 +3808,7 @@ theme	Appearance	外観
 @msg	its editing data is for a different page	編集データが別のページのものです
 @msg	its page has text, and its layers have no text objects to put it in	ページにテキストがありますが、レイヤーにはそれを入れるテキストオブジェクトがありません
 @msg	the art on them differs from the page's in {_1}% of it	レイヤー上のアートの {_1}% がページのアートと異なります
+@msg	the art on them differs from the page's in {_1}% of it: they come from its editing data all the same	レイヤー上のアートの {_1}% がページのアートと異なりますが、レイヤーは編集データから読み込まれました
 @msg	its Windows metafile preview was opened instead, which may simplify the art	代わりに Windows メタファイルのプレビューを開いたため、アートが簡略化されている場合があります
 @msg	its preview was placed instead, at screen resolution	代わりにプレビューを画面解像度で配置しました
 @msg	shadings of more than 4096 patches or triangles were left out	パッチまたは三角形が 4096 個を超えるシェーディングは除外されました
@@ -3903,6 +4011,7 @@ theme	Appearance	外観
 @msg	{_1} font families available	{_1} 個のフォントファミリーを使用できます
 @msg	{_1} has no {_2} style	{_1} には {_2} スタイルがありません
 @msg	Copied the CSS of {rules} object(s)	{rules} 個のオブジェクトの CSS をコピーしました
+@msg	Copied the script report	スクリプトのレポートをコピーしました
 @msg	Exported {path}	{path} を書き出しました
 @msg	no CSS to copy: select objects with CSS of their own	コピーする CSS がありません: 独自の CSS を持つオブジェクトを選択してください
 @msg	unknown highlight `{h}`	`{h}` は不明なハイライトの指定です
@@ -3933,6 +4042,7 @@ theme	Appearance	外観
 @msg	Discarded {_1} recovered document(s)	復帰用データのドキュメントを {_1} 件破棄しました
 @msg	Restored {_1} recovered document(s): save them to keep them	復帰用データからドキュメントを {_1} 件復元しました: 残すには保存してください
 @msg	Saving recovery data for {_1}	{_1} の復帰用データを保存中
+@msg	This shortcut file is in a form VectorCraft can't read.	このショートカットファイルは VectorCraft で読み込めない形式です。
 @msg	bad shortcut	ショートカットが正しくありません
 @msg	can't parse shortcut `{c}`	ショートカット `{c}` を解釈できません
 @msg	can't parse shortcut `{s}` for `{k}`	`{k}` のショートカット `{s}` を解釈できません
@@ -3940,6 +4050,7 @@ theme	Appearance	外観
 @msg	no file reader	ファイルの読み込み機能がありません
 @msg	no file writer	ファイルの書き込み機能がありません
 @msg	not a VectorCraft shortcut set (missing `overrides`)	VectorCraft のショートカットセットではありません (`overrides` がありません)
+@msg	not a shortcut set: the text doesn't start with a slash name and an opening brace	ショートカットセットではありません: テキストの先頭にスラッシュ付きの名前と開き波かっこがありません
 @msg	shortcut for `{k}` must be a string	`{k}` のショートカットは文字列で指定してください
 @msg	tool shortcuts must be a single key (optionally with Shift)	ツールのショートカットには 1 つのキーを指定してください (Shift との組み合わせも可)
 @msg	unknown preset (one of {_1})	不明なプリセットです ({_1} のいずれかを指定してください)
@@ -4126,9 +4237,6 @@ effect	Vertical	垂直
 	Rotation Y	Y 軸回転
 	Rotation Z	Z 軸回転
 	Shading	陰影
-	Direction	方向
-	Elevation	仰角
-	Ambient	環境光
 	Segments	分割数
 	Show axis	軸を表示
 	Reset all	すべてリセット
@@ -4195,3 +4303,70 @@ lighting	Light	ライト
 	Use Outside Rectangle As Frame	外側の長方形をフレームとして使用
 	Create Compound Path From Ellipses	楕円形から複合パスを作成
 	Fill Grid	グリッドを塗りつぶす
+	Select two or more objects, or a group	2 つ以上のオブジェクト、またはグループを選択してください
+# 3D and Materials › Extrude & Bevel, Inflate and Rotate: options, Position presets and bevel shapes.
+	Back	背面
+	Both sides	両面
+	Classic	クラシック
+	Cove	凹面
+	Depth	奥行き
+	Front	正面
+	Isometric Bottom	等角図（底面）
+	Isometric Left	等角図（左）
+	Isometric Right	等角図（右）
+	Isometric Top	等角図（上面）
+	Off-Axis Back	斜め（背面）
+	Off-Axis Bottom	斜め（底面）
+	Off-Axis Front	斜め（正面）
+	Off-Axis Left	斜め（左）
+	Off-Axis Right	斜め（右）
+	Off-Axis Top	斜め（上面）
+	Ogee	S字
+	Reset all 3D settings to their defaults.	すべての 3D 設定を初期値に戻します。
+	Step	段
+	Taper	テーパー
+	Twist	ねじれ
+	Volume	ボリューム
+3d	Cap	キャップ
+3d	Solid	ソリッド
+3d	Hollow	中空
+3d	Bevel	ベベル
+3d	Rounded	丸み
+3d	Space	間隔
+	Bevel Shape	ベベルシェイプ
+	Bevel Inside	ベベルを内側に
+	Bevel both sides	両面にベベル
+	Presets	プリセット
+@msg	An object takes one 3D effect. Edit the existing effect's options, or remove it first.	1 つのオブジェクトに適用できる 3D 効果は 1 つです。既存の効果のオプションを編集するか、先に削除してください。
+@msg	{label} currently requires a path or compound path. Convert type, images and groups to paths first.	{label} には現在、パスまたは複合パスが必要です。テキスト、画像、グループは先にパスに変換してください。
+@msg	{label} requires a shape with at least two anchors	{label} には 2 つ以上のアンカーポイントを持つシェイプが必要です
+@msg	The shape is too complex for a 3D effect	シェイプが複雑すぎるため 3D 効果を適用できません
+@msg	The 3D surface is too complex; simplify the shape	3D サーフェスが複雑すぎます。シェイプを単純化してください
+	Transform Objects	オブジェクトの変形
+@msg	unknown parameter `{key}`; did you mean `{near}`?	`{key}` は不明なパラメーターです。`{near}` のことですか?
+@msg	unknown parameter `{key}`; the command takes no parameters	`{key}` は不明なパラメーターです。このコマンドにパラメーターはありません
+@msg	unknown parameter `{key}`; the command takes: {keys}	`{key}` は不明なパラメーターです。このコマンドで使えるパラメーター: {keys}
+	Load EPS into Clipboard	EPS をクリップボードに読み込む
+@msg	an image of {w} × {h} pixels is too large to draw	{w} × {h} ピクセルの画像は大きすぎて描画できません
+	Basic	基本
+	Fill and Stroke Controls	塗りと線のコントロール
+	Coloring Controls	カラーのコントロール
+	Draw Mode Controls	描画モードのコントロール
+	Screen Mode Controls	スクリーンモードのコントロール
+	Drawer menu	ドロワーメニュー
+	Toolbar: Show Controls	ツールバー: コントロールを表示
+@msg	control must be fillStroke, coloring, drawMode or screenMode	control は fillStroke、coloring、drawMode、screenMode のいずれかです
+@msg	unknown control `{name}`: fillStroke, coloring, drawMode or screenMode	不明なコントロール `{name}`：fillStroke、coloring、drawMode、screenMode のいずれかです
+@msg	give a fraction `t` from 0 to 1	0 から 1 までの値 `t` を指定してください
+@msg	give the path `id`	パスの `id` を指定してください
+@msg	invalid stroke widths	線幅が無効です
+@msg	object has no weighted stroke	オブジェクトに有効な正の線幅を持つ線がありません
+# Corner Radius: a field per corner of a live rectangle.
+	Single Corner Radius	角丸の半径を統一
+	Top Left:	左上:
+	Top Right:	右上:
+	Bottom Left:	左下:
+	Bottom Right:	右下:
+	Softness	柔らかさ
+	Ambient Light	環境光
+	Light behind the object	オブジェクトの背後のライト

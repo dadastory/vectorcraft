@@ -12,6 +12,7 @@ pub mod guard;
 pub mod inspect;
 pub mod journal;
 pub mod link_watch;
+pub mod namematch;
 pub mod steps;
 mod tooling;
 pub mod units;
@@ -27,6 +28,7 @@ use vectorcraft_tools::{PaintDefaults, Tool};
 pub use cmd::EyedropperOptions;
 pub use cmd::clipboard::Clipboard;
 pub use cmd::distortcmds::perspective_click;
+pub use cmd::params::{check_keys, check_params};
 pub use cmd::rasterfx::{export_pdf, flatten_raster_effects};
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
 pub use journal::Journal;
@@ -217,6 +219,25 @@ pub struct Interaction {
     /// The perspective transform the previews make (`perspective.transform` params): Transform
     /// Again repeats it once the drag is committed.
     pub perspective_again: Option<Value>,
+    /// A transform with `copy` keeps the copies it made of the snapshot here ([`PreviewCopies`]).
+    pub(crate) copies: Option<Arc<PreviewCopies>>,
+}
+
+/// This holds the copies that a transform with `copy` made of an interaction's snapshot
+/// ([`cmd::object::apply_transform`]). A later transform with `copy` of the same objects, while
+/// the document is still that snapshot, starts from `doc` and transforms only the copies.
+#[derive(Debug)]
+pub(crate) struct PreviewCopies {
+    /// The copies were made from this snapshot.
+    pub(crate) from: Arc<Document>,
+    /// The transform copied these objects.
+    pub(crate) roots: Vec<NodeId>,
+    /// This is `from` with the copies added, untransformed.
+    pub(crate) doc: Arc<Document>,
+    /// This is the selection after copying, with the copies selected.
+    pub(crate) selection: Selection,
+    /// These are the copies' ids, in the order of `roots`.
+    pub(crate) ids: Vec<NodeId>,
 }
 
 /// An open undo group ([`Session::begin_undo_group`]): the edits made in it are one undo step.
@@ -558,6 +579,15 @@ fn strip_replay_only(id: &str, p: &mut Value) {
     }
 }
 
+/// Is `id` a path made into a guide (View → Guides → Make Guides)?
+pub(crate) fn is_guide_path(d: &Document, id: NodeId) -> bool {
+    d.node(id).is_some_and(|n| matches!(n.kind, NodeKind::Path { guide: true, .. }))
+}
+
+/// The error of an edit that would nest objects deeper than [`vectorcraft_doc::MAX_DEPTH`].
+pub const TOO_DEEP: &str = "objects can't be nested more than 32 deep";
+const _: () = assert!(vectorcraft_doc::MAX_DEPTH == 32, "TOO_DEEP (and its catalog rows) names the cap");
+
 /// Cheap sanity check after an edit: artboards and the objects just touched (the selection) must
 /// have finite, in-range geometry, so saved files always reload and renderers never see NaN/∞.
 fn doc_sane(d: &Document, sel: &Selection) -> bool {
@@ -687,7 +717,7 @@ pub struct Prefs {
     pub canvas_color: String,
     pub auto_collapse_icon_panels: bool,
     /// User Interface › Show Tool Group Labels: the toolbar's group names (Select, Shapes, Draw…);
-    /// off, a faint dash separates the groups instead (#663).
+    /// off (as it ships, #1736), the tools run on from group to group with nothing between them.
     pub tool_group_labels: bool,
     pub open_documents_as_tabs: bool,
     pub large_tabs: bool,
@@ -805,6 +835,8 @@ pub struct Prefs {
     /// the Properties panel and the Control bar (their size fields pass `proportional` to
     /// `object.setBounds`).
     pub constrain_proportions: bool,
+    /// One Corner Radius field sets every corner of a live rectangle (off: a field per corner).
+    pub single_corner_radius: bool,
     /// The tools' persistent options by store (a tool id, or a store a family shares: `liquify`
     /// holds the Liquify tools' Global Brush Dimensions), see [`vectorcraft_tools::settings`]:
     /// kept across tool switches and saved with the preferences. Not a Preferences dialog field:
@@ -825,6 +857,11 @@ pub struct Prefs {
     /// Perspective Grid Options (double-click the Perspective Grid tool): whether the Plane
     /// Switching Widget shows and where (`perspective.widget.options`).
     pub perspective_widget: vectorcraft_tools::distort::perspective::widget::WidgetOptions,
+    /// What names and codes in other apps' shortcut sets stand for, as the user confirmed them on
+    /// import (`importMatches.*`). A local library, not a Preferences dialog field: resetting the
+    /// preferences keeps it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub import_matches: Vec<cmd::importmatches::ImportMatch>,
 }
 
 impl Default for Prefs {
@@ -911,7 +948,7 @@ impl Default for Prefs {
             ui_brightness: s("mediumDark"),
             canvas_color: s("matchUi"),
             auto_collapse_icon_panels: false,
-            tool_group_labels: true,
+            tool_group_labels: false,
             open_documents_as_tabs: true,
             large_tabs: false,
             ui_scaling: 1.0,
@@ -965,10 +1002,12 @@ impl Default for Prefs {
             web_export_settings: None,
             print_presets: vec![],
             constrain_proportions: false,
+            single_corner_radius: true,
             tool_settings: Default::default(),
             perspective_presets: vec![],
             blend_options: None,
             perspective_widget: Default::default(),
+            import_matches: vec![],
         }
     }
 }
@@ -1197,26 +1236,24 @@ impl Session {
         format!("Untitled-{}", self.untitled_counter)
     }
     /// Text layout bounds are a cache (not saved): compute them for a document just read, or
-    /// selection boxes and hit testing would use the rough estimate until each text is edited.
-    fn refresh_text_bounds(doc: &mut Document) {
+    /// selection boxes and hit testing would use the rough estimate until each text is edited, and
+    /// what is fitted to type's bounds (an envelope warping it) would come out differently. That
+    /// holds for the type in symbol definitions, pattern tiles, graph designs and opacity masks too,
+    /// not only in the layers (#1738).
+    pub(crate) fn refresh_text_bounds(doc: &mut Document) {
         // Inline graphics in text take their size from their symbols' art (not saved either).
         doc.resolve_inline_art();
-        let mut texts = vec![];
-        doc.walk(|n| {
-            if matches!(n.kind, NodeKind::Text(_)) {
-                texts.push(n.id);
-            }
-        });
-        for id in texts {
-            if let Some(NodeKind::Text(t)) = doc.node_mut(id).map(|n| &mut n.kind)
-                && t.cached_bounds.is_none()
-            {
-                cmd::typecmd::refresh_bounds(t);
-            }
+        let trees = doc.layers.iter_mut().chain(doc.symbols.iter_mut().map(|s| &mut s.art));
+        let trees = trees.chain(doc.graph_designs.iter_mut().map(|g| &mut g.art));
+        for tree in trees.chain(doc.patterns.iter_mut().flat_map(|p| p.art.iter_mut())) {
+            refresh_tree_text_bounds(tree);
         }
     }
     /// Add a document and make it active.
     pub fn add_document(&mut self, mut doc: Document, path: Option<String>) -> usize {
+        // Every edit is checked against the document before it, so the first one is within the cap
+        // (importers and the native reader have seen to theirs already, with a warning).
+        doc.limit_depth();
         Self::refresh_text_bounds(&mut doc);
         // Guides from files saved before guides had layers go on a layer.
         doc.adopt_guides();
@@ -1234,6 +1271,7 @@ impl Session {
         if index >= self.docs.len() {
             return false;
         }
+        doc.limit_depth();
         Self::refresh_text_bounds(&mut doc);
         doc.adopt_guides();
         if self.active == Some(index) {
@@ -1275,12 +1313,35 @@ impl Session {
         true
     }
 
+    /// `spec`'s `enabled` with `ids` selected instead of the selection, which is then put back.
+    fn enabled_with_selection(&mut self, spec: &CommandSpec, ids: Vec<NodeId>) -> std::result::Result<(), String> {
+        let Some(d) = self.active_mut() else { return (spec.enabled)(self) };
+        let old = std::mem::replace(&mut d.selection, Selection { objects: ids, ..Selection::default() });
+        let r = (spec.enabled)(self);
+        if let Some(d) = self.active_mut() {
+            d.selection = old;
+        }
+        r
+    }
+
     /// Execute a command by id. This is THE entry point for every frontend.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        // The crate's own tests are the audit of the params descriptions (#1442): a key a test
+        // passes that its command's description doesn't name fails the test.
+        #[cfg(test)]
+        self.check_params(id, params)?;
         // Clear's menu needs a selection; an agent supplying explicit targets only needs a
         // document. The command validates those targets before making any edit.
-        let enabled = if id == "edit.clear" && params.get("ids").is_some() { cmd::has_doc(self) } else { (spec.enabled)(self) };
+        let enabled = if id == "edit.clear" && params.get("ids").is_some() {
+            cmd::has_doc(self)
+        } else if let Some(ids) = given_ids(spec.params, params) {
+            // Objects given as `ids` stand in for the selection: the command is enabled as it is
+            // with them selected (#1575).
+            self.enabled_with_selection(spec, ids)
+        } else {
+            (spec.enabled)(self)
+        };
         if let Err(why) = enabled {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
@@ -1425,7 +1486,10 @@ impl Session {
                     if !st.doc.variables.bindings.is_empty() {
                         Arc::make_mut(&mut st.doc).prune_variable_bindings();
                     }
-                    if doc_sane(&st.doc, &st.selection) {
+                    if st.doc.too_deep(Some(&before)) {
+                        // Deeper trees overflow the stack of what walks them.
+                        Err(EngineError::Other(TOO_DEEP.into()))
+                    } else if doc_sane(&st.doc, &st.selection) {
                         Ok(v)
                     } else {
                         Err(EngineError::Other("result would exceed the canvas (coordinates out of range)".into()))
@@ -1458,10 +1522,18 @@ impl Session {
     /// Change only the selection (not an undo step).
     pub fn select(&mut self, f: impl FnOnce(&Document, &mut Selection)) -> Result<()> {
         self.active_appearance_item = None;
+        let guides_locked = self.menu.guides_locked;
         let st = self.doc_mut()?;
         let before = st.selection.objects.clone();
         f(&st.doc, &mut st.selection);
         st.selection.prune(&st.doc);
+        // Lock Guides locks the paths made into guides too (#1534), whatever selects them.
+        if guides_locked {
+            let locked: Vec<NodeId> = st.selection.objects.iter().copied().filter(|id| is_guide_path(&st.doc, *id)).collect();
+            for id in locked {
+                st.selection.remove(id);
+            }
+        }
         // Selecting art makes its layer (or sublayer) the current one, as in the Layers panel of
         // the reference app: new art then goes beside it.
         if st.selection.objects != before
@@ -1496,6 +1568,7 @@ impl Session {
             variables_highlight: st.variables_highlight.clone(),
             isolation: st.isolation,
             perspective_again: None,
+            copies: None,
         });
         Ok(())
     }
@@ -1516,13 +1589,17 @@ impl Session {
                 st.selection.clone_from(&it.selection);
             }
         }
+        // The previous preview's paint is undone with it.
+        self.pending_paint = None;
         let rw = cmd::distortcmds::perspective_rewrite(self, cmd, params);
         let (cmd, params) = rw.as_ref().map_or((cmd, params), |(c, p)| (c.as_str(), p));
         let r = self.execute(cmd, params);
         let params = self.noted(params);
         let st = self.doc_mut()?;
         if let Some(it) = &mut st.interaction {
-            it.preview = Some((cmd.to_string(), params));
+            // A failed preview leaves the document at the snapshot, so nothing is left to commit
+            // (not even an earlier successful preview, which the reset above already undid).
+            it.preview = r.is_ok().then(|| (cmd.to_string(), params));
         }
         r
     }
@@ -1629,6 +1706,31 @@ impl Session {
     }
 }
 
+/// Lay out the type in tree `n` (opacity mask art included) whose bounds aren't cached. Only the
+/// nodes on the way to such type are copied.
+fn refresh_tree_text_bounds(n: &mut Arc<vectorcraft_doc::Node>) {
+    fn stale(n: &vectorcraft_doc::Node) -> bool {
+        matches!(&n.kind, NodeKind::Text(t) if t.cached_bounds.is_none())
+            || n.extras().mask.as_deref().is_some_and(|m| stale(&m.art))
+            || n.children().is_some_and(|ch| ch.iter().any(|c| stale(c)))
+    }
+    if !stale(n) {
+        return;
+    }
+    let n = Arc::make_mut(n);
+    if let NodeKind::Text(t) = &mut n.kind
+        && t.cached_bounds.is_none()
+    {
+        cmd::typecmd::refresh_bounds(t);
+    }
+    if let Some(m) = n.extras_if_any().and_then(|e| e.mask.as_deref_mut()) {
+        refresh_tree_text_bounds(&mut m.art);
+    }
+    for c in n.children_mut().into_iter().flatten() {
+        refresh_tree_text_bounds(c);
+    }
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -1732,6 +1834,8 @@ mod tests_halftone;
 #[cfg(test)]
 mod tests_history_mem;
 #[cfg(test)]
+mod tests_ids_without_selection;
+#[cfg(test)]
 mod tests_inline;
 #[cfg(test)]
 mod tests_journal;
@@ -1739,6 +1843,8 @@ mod tests_journal;
 mod tests_knockout;
 #[cfg(test)]
 mod tests_labspots;
+#[cfg(test)]
+mod tests_large_edits;
 #[cfg(test)]
 mod tests_layerclip;
 #[cfg(test)]
@@ -1787,6 +1893,8 @@ mod tests_paintproxy;
 mod tests_panelcmds;
 #[cfg(test)]
 mod tests_paragraphs;
+#[cfg(test)]
+mod tests_params;
 #[cfg(test)]
 mod tests_pathops;
 #[cfg(test)]
@@ -1854,7 +1962,11 @@ mod tests_saveoptions;
 #[cfg(test)]
 mod tests_scalestrokes;
 #[cfg(test)]
+mod tests_scripts;
+#[cfg(test)]
 mod tests_shaper;
+#[cfg(test)]
+mod tests_shortcutset;
 #[cfg(test)]
 mod tests_slices;
 #[cfg(test)]
@@ -1879,6 +1991,8 @@ mod tests_swatchcmds;
 mod tests_swatches;
 #[cfg(test)]
 mod tests_swatchlib;
+#[cfg(test)]
+mod tests_symbolbounds;
 #[cfg(test)]
 mod tests_targeting;
 #[cfg(test)]
@@ -1913,3 +2027,10 @@ mod tests_widthprofiles;
 mod tests_widthtool;
 #[cfg(test)]
 mod tests_xform;
+
+/// The non-empty `ids` given to a command whose params description names `ids` as a key (the
+/// key callers outside the app may pass it, [`cmd::params::takes_key`]).
+fn given_ids(description: &'static str, params: &Value) -> Option<Vec<NodeId>> {
+    let ids = cmd::ids_param(params, "ids").filter(|ids| !ids.is_empty())?;
+    cmd::params::takes_key(description, "ids").then_some(ids)
+}

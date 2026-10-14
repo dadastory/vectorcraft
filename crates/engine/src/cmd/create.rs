@@ -74,7 +74,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create Text",
             [],
             None,
-            "{x, y, text, vertical?: bool = false, size?: pt, font?: family, style?, color?, area?: {width, height, fit?: none|autoHeight|shrinkText, fitMinPercent?}, placeholder?: bool (fill it with placeholder text instead, as the Type tools do with prefs placeholderText), leadingModel?: \"romanBaseline\"|\"emBoxTop\", charAlign?: \"romanBaseline\"|\"emBoxTop\"|\"emBoxCenter\"|\"emBoxBottom\"|\"icfTop\"|\"icfBottom\" (default: emBoxTop and emBoxCenter while the interface is in Japanese, else romanBaseline)} → {id}; new area type gets Auto Size (fit autoHeight) when the autoSizeAreaType preference is on",
+            "{x, y, text, vertical?: bool = false, size?: pt, font?: family, style?, color?, area?: {width, height, fit?: none|autoHeight|shrinkText, fitMinPercent?}, placeholder?: bool (fill it with placeholder text instead, as the Type tools do with prefs placeholderText), justify?: \"auto\" (default: the start of each paragraph's direction)|\"left\"|\"center\"|\"right\"|\"justifyAll\" (point type: aligned on x, so \"center\" centres each line on the point and \"right\" ends it there; text.setStyle changes it later), leadingModel?: \"romanBaseline\"|\"emBoxTop\", charAlign?: \"romanBaseline\"|\"emBoxTop\"|\"emBoxCenter\"|\"emBoxBottom\"|\"icfTop\"|\"icfBottom\" (default: emBoxTop and emBoxCenter while the interface is in Japanese, else romanBaseline)} → {id, overflow?: [id] (area type whose text doesn't fit its frame: the lines past it aren't drawn; left out when it fits)}; new area type gets Auto Size (fit autoHeight) when the autoSizeAreaType preference is on",
             has_doc,
             text_create
         ),
@@ -502,7 +502,9 @@ fn text_create(s: &mut Session, p: &Value) -> Result<Value> {
         // Lays the text out (and sizes an Auto Size frame).
         super::typecmd::refresh_bounds(&mut t);
     }
-    add_node(s, "Type", NodeKind::Text(Box::new(t)), Appearance::default(), None)
+    let made = add_node(s, "Type", NodeKind::Text(Box::new(t)), Appearance::default(), None)?;
+    let id = made.get("id").and_then(Value::as_u64).map(NodeId);
+    Ok(super::typecmd::with_overflow(s, id.as_slice(), made))
 }
 
 /// The paragraph attributes new type gets (the Type tools, `text.create`): aligned to the start of
@@ -517,12 +519,16 @@ pub(crate) fn new_type_para() -> vectorcraft_doc::ParaStyle {
     }
 }
 
-/// The leading model and character alignment new type starts with (`t`'s paragraph and runs):
-/// `leadingModel` and `charAlign` from `p`, else em box top to top and em box centre while the
+/// The paragraph alignment, leading model and character alignment new type starts with (`t`'s
+/// paragraph and runs): `justify` from `p` (else as [`new_type_para`] left it), `leadingModel`
+/// and `charAlign` from `p`, else em box top to top and em box centre while the
 /// interface is in Japanese (#432), else the Roman baseline for both. Noted in the journal, so a
 /// replay sets the same whatever the interface.
 pub(crate) fn new_type_alignment(s: &mut Session, p: &Value, cmd: &str, t: &mut TextObject) -> Result<()> {
     use vectorcraft_doc::{CharAlign, LeadingModel};
+    if let Some(j) = str_param(p, "justify") {
+        t.para.justify = super::typecmd::justify_param(j).ok_or_else(|| bad(cmd, "justify must be auto|left|center|right|justifyAll"))?;
+    }
     let japanese = s.japanese_interface();
     let leading = match p.get("leadingModel").filter(|v| !v.is_null()) {
         Some(v) => match v.as_str() {

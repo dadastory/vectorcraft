@@ -156,6 +156,33 @@ pub fn layout(db: &FontDb, t: &TextObject) -> TextLayout {
     layout_with(db, t, &opts)
 }
 
+/// Area type in a frame too short for its first line draws nothing (type that doesn't fit its frame
+/// isn't drawn). For importers whose source shows that line: the frame is made taller, from its
+/// top, by what the first line needs. Whether it was.
+pub fn fit_first_line(db: &FontDb, t: &mut TextObject) -> bool {
+    let TextKind::Area { frame } = &t.kind else { return false };
+    let Some(b) = frame.bounds().filter(|b| b.height() > 1e-6) else { return false };
+    if !layout(db, t).lines.is_empty() {
+        return false;
+    }
+    // The height of its first line: the line's as point type.
+    let point = TextObject { kind: TextKind::Point, ..t.clone() };
+    let Some(need) = layout(db, &point).lines.first().map(|l| l.ascent + l.descent) else { return false };
+    // (A little more than it, for the rounding of the layout.)
+    let by = (need + 0.05) / b.height();
+    if !(by.is_finite() && by > 1.0) {
+        return false;
+    }
+    let taller = frame.transformed(Affine::translate((0.0, b.y0)) * Affine::scale_non_uniform(1.0, by) * Affine::translate((0.0, -b.y0)));
+    let short = std::mem::replace(&mut t.kind, TextKind::Area { frame: taller });
+    // Something else keeps the line out (a frame narrower than a letter): as the source has it.
+    if layout(db, t).lines.is_empty() {
+        t.kind = short;
+        return false;
+    }
+    true
+}
+
 /// The underline and strikethrough bars of `t` laid out as `layout` (#847): per run and line, a
 /// bar from the stretch's first glyph to its last one's advance, placed and sized by the font's
 /// own underline and strikeout metrics through the glyph's transform (so the size, baseline shift
@@ -736,8 +763,27 @@ struct Region {
     gap: f64,
 }
 
-/// Flattened closed polygons of a path.
-fn polygons(path: &BezPath) -> Vec<Vec<Point>> {
+/// The largest magnitude a coordinate of a frame, a text wrap shape or the path of type on a path
+/// may have (points), control points included. A frame or path with a larger coordinate, or a
+/// coordinate that isn't finite, holds no text, and a text wrap shape with one is ignored.
+const MAX_COORD: f64 = 1e9;
+
+/// Are the coordinates of `path`, control points included, finite and within [`MAX_COORD`]?
+fn in_range(path: &BezPath) -> bool {
+    let near = |p: &Point| p.x.abs() <= MAX_COORD && p.y.abs() <= MAX_COORD;
+    path.elements().iter().all(|el| match el {
+        PathEl::MoveTo(p) | PathEl::LineTo(p) => near(p),
+        PathEl::QuadTo(a, p) => near(a) && near(p),
+        PathEl::CurveTo(a, b, p) => near(a) && near(b) && near(p),
+        PathEl::ClosePath => true,
+    })
+}
+
+/// Flattened closed polygons of a path; `None` when it isn't [`in_range`].
+fn polygons(path: &BezPath) -> Option<Vec<Vec<Point>>> {
+    if !in_range(path) {
+        return None;
+    }
     let mut polys: Vec<Vec<Point>> = Vec::new();
     kurbo::flatten(path, 0.1, |el| match el {
         PathEl::MoveTo(p) => polys.push(vec![p]),
@@ -749,7 +795,7 @@ fn polygons(path: &BezPath) -> Vec<Vec<Point>> {
         _ => {}
     });
     polys.retain(|p| p.len() >= 3);
-    polys
+    Some(polys)
 }
 
 /// Inside intervals (even-odd) of the horizontal line at `y` through `polys`.
@@ -817,9 +863,13 @@ fn intersect_intervals(a: &[(f64, f64)], b: &[(f64, f64)]) -> Vec<(f64, f64)> {
 
 impl Region {
     fn cells(path: &BezPath, opts: &LayoutOptions, wrap: &[vectorcraft_doc::WrapShape]) -> Vec<Region> {
-        let polys = polygons(path);
-        let wraps: Vec<(Vec<Vec<Point>>, f64, bool)> =
-            wrap.iter().map(|w| (polygons(&w.path.to_bezpath()), w.wrap.offset.max(0.0), w.wrap.invert)).filter(|w| !w.0.is_empty()).collect();
+        // A frame out of range has no cells, and a wrap shape out of range is left out.
+        let Some(polys) = polygons(path) else { return vec![] };
+        let wraps: Vec<(Vec<Vec<Point>>, f64, bool)> = wrap
+            .iter()
+            .filter_map(|w| Some((polygons(&w.path.to_bezpath())?, w.wrap.offset.max(0.0), w.wrap.invert)))
+            .filter(|w| !w.0.is_empty())
+            .collect();
         let bbox = path.bounding_box();
         let rect = polys.len() == 1 && {
             let area: f64 = polys[0].iter().zip(polys[0].iter().cycle().skip(1)).map(|(a, b)| a.x * b.y - b.x * a.y).sum::<f64>().abs() * 0.5;
@@ -963,13 +1013,36 @@ struct Pen<'r> {
     /// Leading measured from em box top to em box top: where the next line's em box top goes.
     model: LeadingModel,
     next_top: Option<f64>,
+    /// The narrowest word no line from here down is wide enough for (see [`Pen::place`]).
+    no_room_for: f64,
 }
 
+/// The largest number of steps layout takes to move a line down a frame cell to find room for it:
+/// in a cell taller than this many leads, a step is the cell's height divided by this.
+const MAX_STEPS: usize = 100_000;
+
 impl Pen<'_> {
-    /// Baseline and horizontal span for a line with estimated metrics `est` and indents; `None` =
-    /// the frame is full (overflow).
+    /// Baseline and horizontal span for a line with estimated metrics `est` and indents that starts
+    /// with a word `word` wide; `None` = the frame is full (overflow).
+    /// In a frame that isn't a rectangle, lines too short for the word are left empty and it moves
+    /// down to the first one wide enough. Only when no line is does it go on the first line with
+    /// room for any text, and get broken there.
     /// The `bool` is true for a further span at the previous line's baseline.
-    fn place(&mut self, est: Metrics, ind_l: f64, ind_r: f64) -> Option<(f64, f64, f64, bool)> {
+    fn place(&mut self, est: Metrics, ind_l: f64, ind_r: f64, word: f64) -> Option<(f64, f64, f64, bool)> {
+        if word > 0.0 && word < self.no_room_for {
+            let mut pen = self.clone();
+            if let Some(placed) = pen.place_at_least(est, ind_l, ind_r, word) {
+                *self = pen;
+                return Some(placed);
+            }
+            // Lines further down are no wider for this word: don't search for it, or a wider one, again.
+            self.no_room_for = word;
+        }
+        self.place_at_least(est, ind_l, ind_r, 0.0)
+    }
+
+    /// [`Pen::place`], skipping lines of a non-rectangular frame narrower than `min`.
+    fn place_at_least(&mut self, est: Metrics, ind_l: f64, ind_r: f64, min: f64) -> Option<(f64, f64, f64, bool)> {
         let Some(regions) = self.regions else {
             let b = self.prev.map_or(0.0, |b| self.next_baseline(b, est));
             return Some((b, f64::NEG_INFINITY, f64::INFINITY, false));
@@ -985,21 +1058,29 @@ impl Pen<'_> {
                 None => r.top() + r.shift + est.first_baseline(self.fb, self.fb_min),
                 Some(b) => self.next_baseline(b, est) + r.gap,
             };
-            loop {
+            // The baseline moves down the cell a lead at a time, or a `MAX_STEPS`th of the cell's
+            // height when that is more, in at most `MAX_STEPS` steps.
+            let step = est.lead.max(1.0).max(r.cell.height() / MAX_STEPS as f64);
+            for _ in 0..=MAX_STEPS {
                 if baseline + est.desc > r.bottom() + 0.01 {
                     break;
                 }
-                let fits = |&(a, b): &(f64, f64)| b - a - ind_l - ind_r > est.asc.max(1.0);
+                // A rectangle's lines are all as wide: none below has more room for the word.
+                let min = if r.rect || r.polys.is_empty() { 0.0 } else { min };
+                let fits = |&(a, b): &(f64, f64)| {
+                    let room = b - a - ind_l - ind_r;
+                    room > est.asc.max(1.0) && room + EPS >= min
+                };
                 if r.wraps.is_empty() {
                     match r.span(baseline - est.asc, baseline + est.desc) {
                         Some(s) if fits(&s) => return Some((baseline, s.0, s.1, false)),
-                        _ => baseline += est.lead.max(1.0),
+                        _ => baseline += step,
                     }
                 } else {
                     // Wrap objects can split a line: fill every span, left to right.
                     let mut spans: Vec<(f64, f64)> = r.spans(baseline - est.asc, baseline + est.desc).into_iter().filter(fits).collect();
                     if spans.is_empty() {
-                        baseline += est.lead.max(1.0);
+                        baseline += step;
                         continue;
                     }
                     let (a, b) = spans.remove(0);
@@ -1032,9 +1113,9 @@ impl Pen<'_> {
 }
 
 /// Advance of a tab at pen position `x`: up to the next stop after it (explicit stops first, then
-/// every ½ inch). Right, centre and decimal stops align the text that follows (`rest`, up to the
-/// next tab) on the stop.
-fn tab_advance(tabs: &[vectorcraft_doc::TabStop], origin: f64, x: f64, rest: &[SGlyph]) -> f64 {
+/// every ½ inch), and the leader of that stop (default stops have none). Right, centre and decimal
+/// stops align the text that follows (`rest`, up to the next tab) on the stop.
+fn tab_advance<'t>(tabs: &'t [vectorcraft_doc::TabStop], origin: f64, x: f64, rest: &[SGlyph]) -> (f64, &'t str) {
     use vectorcraft_doc::TabAlign;
     let rel = x - origin;
     let seg: Vec<&SGlyph> = rest.iter().take_while(|g| g.ch != '\t').collect();
@@ -1047,14 +1128,71 @@ fn tab_advance(tabs: &[vectorcraft_doc::TabStop], origin: f64, x: f64, rest: &[S
     };
     let explicit = tabs.iter().find_map(|t| {
         let at = target(t.position, t.align, t.align_on);
-        (at > rel + 1e-6).then_some(at)
+        (at > rel + 1e-6).then_some((at, t.leader.as_str()))
     });
-    let at = explicit.unwrap_or_else(|| {
+    let (at, leader) = explicit.unwrap_or_else(|| {
         let last = tabs.iter().map(|t| t.position).fold(0.0, f64::max).max(0.0);
         let base = rel.max(last);
-        ((base / vectorcraft_doc::text::DEFAULT_TAB_INTERVAL).floor() + 1.0) * vectorcraft_doc::text::DEFAULT_TAB_INTERVAL
+        (((base / vectorcraft_doc::text::DEFAULT_TAB_INTERVAL).floor() + 1.0) * vectorcraft_doc::text::DEFAULT_TAB_INTERVAL, "")
     });
-    (at - rel).max(0.0)
+    ((at - rel).max(0.0), leader)
+}
+
+/// Most copies of a leader drawn in one tab: a tiny type size and a far stop must not make
+/// millions of outlines.
+const MAX_LEADER_COPIES: f64 = 4096.0;
+
+/// The outline of a tab leader: `leader`'s characters, in the font and size of tab `g`, repeated
+/// across the tab's gap `from..to` on baseline `y`. Copies sit on a grid of the leader's width
+/// from `origin` (where tab stops are measured from), so the leaders of lines above one another
+/// line up; only whole copies are drawn. Characters the font lacks draw nothing.
+fn leader_outline(db: &FontDb, g: &SGlyph, leader: &str, origin: f64, from: f64, to: f64, y: f64) -> BezPath {
+    let mut out = BezPath::new();
+    let glyphs: Vec<(u32, f64)> = leader
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| {
+            let gid = g.face.glyph_for(c);
+            (gid, g.face.advance(gid) * g.sx)
+        })
+        .collect();
+    let width: f64 = glyphs.iter().map(|(_, a)| a).sum();
+    if !(width > EPS && width.is_finite() && from.is_finite() && to.is_finite()) {
+        return out;
+    }
+    let first = ((from - origin) / width - EPS).ceil();
+    let copies = (((to - origin) / width + EPS).floor() - first).clamp(0.0, MAX_LEADER_COPIES) as usize;
+    let local = Affine::rotate(-g.rotation.to_radians()) * Affine::translate((0.0, -g.bshift)) * Affine::scale_non_uniform(g.sx, g.sy);
+    for k in 0..copies {
+        let mut pen = origin + (first + k as f64) * width;
+        for &(gid, adv) in &glyphs {
+            if gid != 0 {
+                let m = Affine::translate((pen, y)) * local;
+                out.extend(db.outline(&g.face, gid).elements().iter().map(|el| m * *el));
+            }
+            pen += adv;
+        }
+    }
+    out
+}
+
+/// Width of the word starting at glyph `i`: its advances up to the first break opportunity (spaces
+/// left out, the hyphen of a soft hyphen in), the least room a line needs not to break inside it.
+fn word_width(g: &[SGlyph], i: usize) -> f64 {
+    let mut w = 0.0;
+    for gl in g.get(i..).unwrap_or_default() {
+        if gl.is_space() {
+            break;
+        }
+        if gl.is_soft_hyphen() {
+            return w + hyphen_glyph(gl).adv;
+        }
+        w += gl.adv;
+        if gl.break_after() {
+            break;
+        }
+    }
+    w
 }
 
 /// Greedy break: returns (end glyph index, hyphenated) for a line starting at `i` of `width`.
@@ -1393,7 +1531,10 @@ fn compose_para(cx: &Ctx<'_>, sg: &[SGlyph], para: &ParaStyle, pen: &Pen<'_>, rt
     while widths.len() < sg.len() {
         let first = widths.is_empty();
         let ind_l = para.left_indent + if first { para.first_line_indent } else { 0.0 };
-        let Some((b, x0, x1, _)) = sim.place(m, ind_l, para.right_indent) else { break };
+        // Only the first line's first word is known here. Later lines are placed as the composed
+        // lines need: each fits its width, so its first word does too.
+        let word = if first { word_width(sg, 0) } else { 0.0 };
+        let Some((b, x0, x1, _)) = sim.place(m, ind_l, para.right_indent, word) else { break };
         let w = x1 - x0 - ind_l - para.right_indent;
         widths.push(w);
         acc += w.max(1.0);
@@ -1435,6 +1576,7 @@ fn flow(cx: &mut Ctx<'_>, paras: &[Range<usize>], t: &TextObject, regions: Optio
         queued: vec![],
         model: t.para_at(0).leading_model,
         next_top: None,
+        no_room_for: f64::INFINITY,
     };
     'paras: for (pi, pr) in paras.iter().enumerate() {
         let para = t.para_at(pi);
@@ -1470,6 +1612,8 @@ fn flow(cx: &mut Ctx<'_>, paras: &[Range<usize>], t: &TextObject, regions: Optio
             let est = if i < n { Metrics::of(&sg[i]) } else { pm };
             let first_line = li_para == 0;
             let ind_l = para.left_indent + if first_line { para.first_line_indent } else { 0.0 };
+            // Measured before Mojikumi narrows an opening bracket, as the composer measures it.
+            let word = word_width(&sg, i);
             // Mojikumi: an opening bracket starting a line is set flush with the line's start (the
             // space before it goes), and the line has that much more room. At a paragraph's start
             // that is the first-line indent: JIS X 4051's principle (JLREQ 3.1.5, Figure 71 ①).
@@ -1486,7 +1630,7 @@ fn flow(cx: &mut Ctx<'_>, paras: &[Range<usize>], t: &TextObject, regions: Optio
             // next row/column if it no longer fits).
             let (baseline, x0, x1, end, hyph, m) = loop {
                 let first_in_region = pen.prev.is_none();
-                let Some((mut baseline, x0, x1, same_baseline)) = pen.place(est, ind_l, para.right_indent) else {
+                let Some((mut baseline, x0, x1, same_baseline)) = pen.place(est, ind_l, para.right_indent, word) else {
                     cx.out.overflow = cx.text.len() > if i < n { sg[i].byte } else { pr.start };
                     break 'paras;
                 };
@@ -1628,8 +1772,9 @@ fn flow(cx: &mut Ctx<'_>, paras: &[Range<usize>], t: &TextObject, regions: Optio
                 if j + 1 == trimmed {
                     adv -= end_trim;
                 }
+                let mut leader = "";
                 if g.ch == '\t' {
-                    adv = tab_advance(&para.tabs, tab_origin, x, &sg[j + 1..trimmed.max(j + 1)]);
+                    (adv, leader) = tab_advance(&para.tabs, tab_origin, x, &sg[j + 1..trimmed.max(j + 1)]);
                 } else if j < body {
                     if g.is_space() {
                         adv += per_space;
@@ -1644,6 +1789,14 @@ fn flow(cx: &mut Ctx<'_>, paras: &[Range<usize>], t: &TextObject, regions: Optio
                 }
                 let y = baseline - align_shift(g, cx.style_at(g.byte).char_align, line_em, cx.vertical);
                 cx.emit(g, Affine::translate((x, y)), Point::new(x, y), 0.0, adv, li);
+                if !leader.is_empty() {
+                    // The leader belongs to the tab's glyph: the gap stays one character for the
+                    // caret, selection and hit testing.
+                    let dots = leader_outline(cx.db, g, leader, tab_origin, x, x + adv, y);
+                    if let Some(tab) = cx.out.glyphs.last_mut() {
+                        tab.outline.extend(dots);
+                    }
+                }
                 x += adv;
                 if j < trimmed {
                     x_end = x;
@@ -1725,7 +1878,8 @@ fn on_path(cx: &mut Ctx<'_>, paras: &[Range<usize>], t: &TextObject, path: &Path
         }
     }
     let rtl = rtl.unwrap_or(false);
-    let ap = ArcPath::new(path);
+    // A path out of range holds no text, as a path with no length holds none.
+    let ap = if in_range(&path.to_bezpath()) { ArcPath::new(path) } else { ArcPath::default() };
     let m = Metrics::max(&sg).map(|m| (m.asc, m.desc)).unwrap_or_else(|| {
         let s = style_metrics(cx.db, cx.style_at(0));
         (s.0, s.1)
