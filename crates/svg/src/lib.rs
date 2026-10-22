@@ -190,6 +190,13 @@ pub struct ExportOptions {
     /// it (the engine's `artboard`/`range`/`useArtboards` params), so it is not deserialized.
     #[serde(skip)]
     pub artboard: Option<usize>,
+    /// The file is the one artboard `artboard` names, exported on its own (Export As with Use
+    /// Artboards, Export for Screens, Asset Export, an `artboard`/`range` param): its `<title>` is
+    /// the artboard's name, else (unnamed) the document's title (#3544). Off, the file stands for
+    /// the document (Save, Save As) and has the document's title. Callers set it with `artboard`,
+    /// so it is not deserialized either.
+    #[serde(skip)]
+    pub artboard_title: bool,
     pub styling: Styling,
     /// Decimal places for coordinates (1–7 in the dialog; default 3).
     pub decimals: u8,
@@ -225,6 +232,7 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             artboard: Some(0),
+            artboard_title: false,
             styling: Styling::PresentationAttributes,
             decimals: 3,
             object_ids: ObjectIds::LayerNames,
@@ -524,7 +532,8 @@ pub type ReadFile<'a> = &'a (dyn Fn(&str) -> Option<(Vec<u8>, vectorcraft_doc::L
 /// warning), so it can be relinked.
 #[derive(Clone, Copy, Default)]
 pub struct ImportOptions<'a> {
-    /// The folder relative links are found in: the SVG file's own. Without it they can't be read.
+    /// The folder relative links are found in: the SVG file's own (taken from the working
+    /// directory when it isn't absolute). Without it they can't be read.
     pub folder: Option<&'a str>,
     /// Reads a linked file. Without it no file is read.
     pub read: Option<ReadFile<'a>>,

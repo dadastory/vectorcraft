@@ -1,15 +1,18 @@
 //! `plugin.*` commands: sandboxed WebAssembly plug-ins (`vectorcraft-plugins`).
 //!
-//! Plug-ins are installed per process (`plugin.install`, or every `*.wasm` in the Additional
-//! Plug-ins Folder preference) and listed with `plugin.list` / `plugin.info`. Object filters run
+//! Plug-ins are installed with `plugin.install` (kept across restarts in the apps' plug-in folder,
+//! [`Session::attach_plugin_store`]) or from every `*.wasm` in the Additional Plug-ins Folder
+//! preference, and listed with `plugin.list` / `plugin.info`. Object filters run
 //! with `plugin.run` on the selected paths and compound paths (one undo step, transactional: a
 //! plug-in that fails leaves the document untouched); live-effect plug-ins are applied like any
-//! effect (`effect.apply {effect: "plugin.<id>"}`) and drawn by `vectorcraft-effects`.
+//! effect (`effect.apply {effect: "plugin.<id>"}`) and drawn by `vectorcraft-effects`; exporters
+//! add a file format that `document.export` writes (`fileio::plugin_formats`).
 
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value, json};
-use vectorcraft_plugins::{Kind, Plugin, effect, objects, registry};
+use vectorcraft_doc::{Effect, Node};
+use vectorcraft_plugins::{Kind, Plugin, effect, export, objects, registry};
 
 use super::*;
 
@@ -26,8 +29,13 @@ pub fn describe(p: &Plugin) -> Value {
         "params": m.params_doc(), "paramsSchema": serde_json::to_value(m).ok().and_then(|v| v.get("params").cloned()),
         "size": p.size(), "source": p.source(),
     });
-    if m.kind == Kind::Effect {
-        v["effect"] = json!(effect::effect_id(&m.id));
+    match m.kind {
+        Kind::Effect => v["effect"] = json!(effect::effect_id(&m.id)),
+        Kind::Exporter => {
+            v["format"] = json!(export::format_id(&m.id));
+            v["extensions"] = json!(m.extensions);
+        }
+        Kind::Filter => {}
     }
     v
 }
@@ -51,12 +59,22 @@ fn plugin_by_id(cmd: &str, p: &Value) -> Result<Arc<Plugin>> {
     registry::get(id).ok_or_else(|| err(vectorcraft_plugins::Error::NotFound(id.into())))
 }
 
+/// `plugin.run`: runs filter `id` on `ids` (else the selected paths and compound paths) with its
+/// parameters and `_context`, and applies its output as one undo step ([`objects::apply_output`];
+/// effect records as [`admit_effects`] admits them). → `{plugin, ids}`: what it made or changed,
+/// which is then selected.
 fn run(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "plugin.run";
     let plugin = plugin_by_id(C, p)?;
     let m = plugin.manifest();
-    if m.kind != Kind::Filter {
-        return Err(bad(C, format!("`{}` is a live effect: apply it with effect.apply {{\"effect\": \"{}\"}}", m.id, effect::effect_id(&m.id))));
+    match m.kind {
+        Kind::Filter => {}
+        Kind::Effect => {
+            return Err(bad(C, format!("`{}` is a live effect: apply it with effect.apply {{\"effect\": \"{}\"}}", m.id, effect::effect_id(&m.id))));
+        }
+        Kind::Exporter => {
+            return Err(bad(C, format!("`{}` is an exporter: export with document.export {{\"format\": \"{}\"}}", m.id, export::format_id(&m.id))));
+        }
     }
     // Bad parameters fail before anything runs.
     let mut params = Value::Object(m.resolve_params(&plugin_params(p)).map_err(|e| bad(C, e.to_string()))?);
@@ -72,11 +90,55 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let params = serde_json::to_vec(&params).map_err(|e| bad(C, e.to_string()))?;
     let out = objects::decode(&plugin.run(&input, &params).map_err(err)?).map_err(err)?;
     let ids = s.edit(m.name.trim_end_matches('…'), |d, sel| {
-        let ids = objects::apply_output(d, &inputs, out, parent).map_err(err)?;
+        let ids = objects::apply_output(d, &inputs, out, parent, &admit_effects).map_err(err)?;
         sel.set(ids.iter().copied());
         Ok(ids)
     })?;
     Ok(json!({"plugin": m.id, "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>()}))
+}
+
+/// Admits the effect records a filter returned for object `n` (written, its effects still its own)
+/// as `effect.apply` would apply them: each new record a known effect (one of ours, or an installed
+/// live-effect plug-in) with parameters it takes, filled in to their defaults. A record the object
+/// already had stays as it was. An object takes one 3D effect (its fills' and strokes' own
+/// counted), which must fit it, and the `textureImage` of an effect with Load Texture (Glass,
+/// Texturizer) comes as the effect stores it, never as a file to read: a plug-in can't have the
+/// host read one.
+fn admit_effects(fx: &[Effect], n: &Node) -> std::result::Result<Vec<Effect>, String> {
+    use vectorcraft_render::effects;
+    const C: &str = "plugin.run";
+    let mut out = Vec::with_capacity(fx.len());
+    for (j, e) in fx.iter().enumerate() {
+        if n.appearance.effects.contains(e) {
+            out.push(e.clone());
+            continue;
+        }
+        let refuse = |why: String| format!("[{j}] `{}`: {why}", e.id);
+        let params = if e.params.is_null() { json!({}) } else { e.params.clone() };
+        match effect::installed(&e.id) {
+            Some(plugin) => {
+                plugin.manifest().resolve_params(&params).map_err(|why| refuse(why.to_string()))?;
+            }
+            None => super::params::check_effect_params(C, &e.id, &params).map_err(|why| refuse(why.to_string()))?,
+        }
+        if super::effectcmd::texture_load_effect(&e.id)
+            && let Some(t) = params.get(effects::pixel::TEXTURE_IMAGE)
+            && t.as_str().is_none_or(|t| effects::pixel::texture(t).is_none())
+        {
+            return Err(refuse("`textureImage` must be a texture as effect.list gives it".into()));
+        }
+        let mut admitted = effects::new_effect(&e.id, &params).ok_or_else(|| refuse("no such effect".into()))?;
+        if effects::is_three_d(&e.id) {
+            effects::validate_three_d(n, &e.id, &admitted.params).map_err(refuse)?;
+        }
+        admitted.visible = e.visible;
+        out.push(admitted);
+    }
+    let items = n.appearance.items.iter().flat_map(|i| i.effects());
+    if out.iter().chain(items).filter(|e| effects::is_three_d(&e.id)).count() > 1 {
+        return Err(super::effectcmd::ONE_3D.into());
+    }
+    Ok(out)
 }
 
 /// Largest base64 payload `plugin.install` accepts (the module limit, encoded).
@@ -85,19 +147,20 @@ const MAX_DATA_CHARS: usize = (32 << 20) / 3 * 4 + 4;
 /// The `.wasm` extension plug-in files have (File › Open installs them).
 pub const EXTS: &[&str] = &["wasm"];
 
-fn install(_: &mut Session, p: &Value) -> Result<Value> {
+fn install(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "plugin.install";
-    let plugin = match (str_param(p, "path").filter(|s| !s.is_empty()), str_param(p, "dataBase64")) {
+    let (plugin, bytes) = match (str_param(p, "path").filter(|s| !s.is_empty()), str_param(p, "dataBase64")) {
         (_, Some(data)) => {
             if data.len() > MAX_DATA_CHARS {
                 return Err(bad(C, "`dataBase64` is larger than the module limit"));
             }
             let bytes = vectorcraft_format::base64_decode(data).ok_or_else(|| bad(C, "`dataBase64` is not valid base64"))?;
             let plugin = Plugin::load(&bytes, vectorcraft_plugins::Limits::default()).map_err(err)?;
-            match str_param(p, "name") {
+            let plugin = match str_param(p, "name") {
                 Some(name) => plugin.with_source(name),
                 None => plugin,
-            }
+            };
+            (plugin, bytes)
         }
         (Some(path), None) => load_path(path)?,
         (None, None) => return Err(bad(C, "give `path` (a .wasm file) or `dataBase64` (the module)")),
@@ -105,17 +168,22 @@ fn install(_: &mut Session, p: &Value) -> Result<Value> {
     if !p.get("replace").and_then(Value::as_bool).unwrap_or(true) && registry::get(plugin.id()).is_some() {
         return Err(bad(C, format!("a plug-in with id {:?} is already installed", plugin.id())));
     }
+    // Installed plug-ins stay installed after a restart (#2541).
+    s.store_plugin(plugin.id(), &bytes);
     Ok(describe(&registry::install(plugin)))
 }
 
+/// The plug-in in the `.wasm` file `path`, and its module.
 #[cfg(not(target_arch = "wasm32"))]
-fn load_path(path: &str) -> Result<Plugin> {
+fn load_path(path: &str) -> Result<(Plugin, Vec<u8>)> {
     crate::file_access::check_read(path).map_err(EngineError::Other)?;
-    registry::load_file(std::path::Path::new(path), vectorcraft_plugins::Limits::default()).map_err(err)
+    let limits = vectorcraft_plugins::Limits::default();
+    let bytes = crate::store::read_capped(std::path::Path::new(path), limits.max_module_bytes as u64).map_err(EngineError::Other)?;
+    Ok((Plugin::load(&bytes, limits).map_err(err)?.with_source(path), bytes))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn load_path(_: &str) -> Result<Plugin> {
+fn load_path(_: &str) -> Result<(Plugin, Vec<u8>)> {
     Err(EngineError::Other("installing from a path is not available on the web; pass the module as `dataBase64`".into()))
 }
 
@@ -162,7 +230,7 @@ fn reload(s: &mut Session, p: &Value) -> Result<Value> {
         None => s.prefs.plugins_folder.trim().to_string(),
     };
     if folder.is_empty() {
-        return Err(bad(C, "no folder: pass `path` or set Preferences › Performance & Storage › Additional Plug-ins Folder"));
+        return Err(bad(C, "no folder: pass `path` or set Preferences › Plug-ins & Scratch Disks › Additional Plug-ins Folder"));
     }
     let report = load_folder(&folder);
     if let Some(e) = report.get("error").and_then(Value::as_str) {
@@ -186,8 +254,9 @@ fn info(_: &mut Session, p: &Value) -> Result<Value> {
     Ok(v)
 }
 
-fn remove(_: &mut Session, p: &Value) -> Result<Value> {
+fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let id = str_param(p, "id").ok_or_else(|| bad("plugin.remove", "missing `id`"))?;
+    s.unstore_plugin(id);
     if registry::remove(id) { Ok(json!({"removed": id})) } else { Err(err(vectorcraft_plugins::Error::NotFound(id.into()))) }
 }
 
@@ -198,7 +267,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "List Plug-ins",
             [],
             None,
-            "{} → {plugins: [{id, name, version, kind: \"filter\"|\"effect\", author, description, params (doc), paramsSchema, effect? (the effect id of a live effect: plugin.<id>), size, source}], folder: the Additional Plug-ins Folder load report {folder, loaded, failed: [{file, error}]} | null}",
+            "{} → {plugins: [{id, name, version, kind: \"filter\"|\"effect\"|\"exporter\", author, description, params (doc), paramsSchema, effect? (the effect id of a live effect: plugin.<id>), format? and extensions? (an exporter's format id, plugin.<id>, for document.export, and its file extensions), size, source}], folder: the Additional Plug-ins Folder load report {folder, loaded, failed: [{file, error}]} | null}",
             always,
             list
         ),

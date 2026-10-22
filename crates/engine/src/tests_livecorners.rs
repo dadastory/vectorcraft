@@ -158,7 +158,7 @@ fn corners_of_a_non_square_rectangle_are_alike_circles() {
         let d = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().doc);
         let NodeKind::Path { path, live: Some(live), .. } = &mut d.node_mut(id).unwrap().kind else { panic!("not live") };
         let xf = Affine::translate((10.0, 10.0)) * Affine::scale_non_uniform(2.0, 1.0);
-        **live = LiveShape::Rectangle { w: 50.0, h: 60.0, radii: [10.0; 4], kinds: Default::default(), xf };
+        **live = LiveShape::Rectangle { w: 50.0, h: 60.0, radii: [10.0; 4], kinds: Default::default(), radii_relative: false, xf };
         *path = live.to_path();
     }
     assert_eq!(spans(&s, id)[0], (20.0, 10.0));
@@ -331,6 +331,99 @@ fn an_ellipse_takes_pie_angles_and_inverts() {
     assert!(s.execute("object.setLiveShape", &json!({"pieStart": "half"})).is_err());
 }
 
+/// Invert Pie and Make Sides Equal given as text or as another value that is not true or false are
+/// an error naming the key: the ellipse's pie, the polygon and the undo history stay as they were.
+/// True makes the change, and false and null leave the shape as it is.
+#[test]
+fn invert_pie_and_make_sides_equal_refuse_a_boolean_given_as_text() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 300, "height": 300})).unwrap();
+    let id = |v: Value| NodeId(v["id"].as_u64().unwrap());
+    let ellipse = id(s.execute("shape.ellipse", &json!({"x": 0, "y": 0, "width": 200, "height": 100})).unwrap());
+    run(&mut s, json!({"id": ellipse.0, "pieStart": 0, "pieEnd": 90}));
+    let polygon = id(s.execute("shape.polygon", &json!({"cx": 200, "cy": 200, "radius": 50, "sides": 6})).unwrap());
+    s.execute("object.scale", &json!({"sx": 200, "sy": 100})).unwrap();
+    let shapes = |s: &Session| {
+        let d = &s.doc().unwrap().doc;
+        [ellipse, polygon].map(|i| match &d.node(i).unwrap().kind {
+            NodeKind::Path { live: Some(l), .. } => (**l).clone(),
+            k => panic!("{k:?}"),
+        })
+    };
+    let undo = |s: &Session| s.doc().unwrap().history.undo.len();
+    let before = (undo(&s), shapes(&s));
+    for (key, p) in [
+        ("invertPie", json!({"id": ellipse.0, "invertPie": "true"})),
+        ("invertPie", json!({"id": ellipse.0, "pieEnd": 180, "invertPie": 1})),
+        ("makeSidesEqual", json!({"id": polygon.0, "makeSidesEqual": "true"})),
+        ("makeSidesEqual", json!({"id": polygon.0, "sides": 5, "makeSidesEqual": [true]})),
+    ] {
+        let r = s.execute("object.setLiveShape", &p);
+        let want = format!("`{key}` must be true or false");
+        assert!(matches!(&r, Err(EngineError::BadParams { msg, .. }) if *msg == want), "{p}: {r:?}");
+        assert_eq!((undo(&s), shapes(&s)), before, "{p}");
+    }
+    for p in [json!({"id": ellipse.0, "invertPie": false}), json!({"id": polygon.0, "makeSidesEqual": null})] {
+        run(&mut s, p);
+    }
+    assert_eq!((undo(&s), shapes(&s)), before);
+    run(&mut s, json!({"id": ellipse.0, "invertPie": true}));
+    run(&mut s, json!({"id": polygon.0, "makeSidesEqual": true}));
+    let [LiveShape::Ellipse { pie, .. }, l] = shapes(&s) else { panic!("an ellipse and a polygon") };
+    assert_eq!(pie, (90.0, 360.0));
+    assert!(l.polygon_sides_equal());
+}
+
+/// The Selection tool's pie widgets: dragging the End widget from 0° to straight up sets Pie End
+/// Angle to 90 in one undo step; on an inverted pie a drag moves only the dragged angle; a
+/// double-click on a widget makes the ellipse whole again in one step.
+#[test]
+fn dragging_and_double_clicking_the_pie_widgets() {
+    use vectorcraft_tools::{Mods, PointerEvent, PointerKind};
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 300, "height": 300})).unwrap();
+    let id = NodeId(s.execute("shape.ellipse", &json!({"x": 50, "y": 100, "width": 200, "height": 100})).unwrap()["id"].as_u64().unwrap());
+    let pie = |s: &Session| match &s.doc().unwrap().doc.node(id).unwrap().kind {
+        NodeKind::Path { live: Some(l), .. } => match &**l {
+            LiveShape::Ellipse { pie, .. } => *pie,
+            k => panic!("{k:?}"),
+        },
+        k => panic!("{k:?}"),
+    };
+    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+    let steps = |s: &Session| s.doc().unwrap().history.undo.len();
+    let v = ViewInfo::default();
+    s.select_tool("selection", v).unwrap();
+    let gesture = |s: &mut Session, events: &[(PointerKind, f64, f64)]| {
+        for (kind, x, y) in events {
+            s.pointer(&PointerEvent::new(*kind, *x, *y).with_mods(Mods::default()), v).unwrap();
+        }
+    };
+    // The center is (150, 150); both widgets of the whole ellipse sit 12 pt right of (250, 150).
+    let n = steps(&s);
+    gesture(&mut s, &[(PointerKind::Down, 262.0, 150.0), (PointerKind::Drag, 150.0, 20.0), (PointerKind::Up, 150.0, 20.0)]);
+    assert!(near(pie(&s), (0.0, 90.0)), "{:?}", pie(&s));
+    assert_eq!(steps(&s), n + 1);
+    // Inverted, the pie runs from 90° to 360°: dragging the End widget (back at 0°) to 270°
+    // leaves the start at 90°.
+    s.execute("object.setLiveShape", &json!({"invertPie": true})).unwrap();
+    assert!(near(pie(&s), (90.0, 360.0)));
+    gesture(&mut s, &[(PointerKind::Down, 262.0, 150.0), (PointerKind::Drag, 150.0, 280.0), (PointerKind::Up, 150.0, 280.0)]);
+    assert!(near(pie(&s), (90.0, 270.0)), "{:?}", pie(&s));
+    // The Start widget sits 12 pt above the top of the outline, at 90°.
+    let n = steps(&s);
+    gesture(
+        &mut s,
+        &[(PointerKind::Down, 150.0, 88.0), (PointerKind::Up, 150.0, 88.0), (PointerKind::Down, 150.0, 88.0), (PointerKind::Up, 150.0, 88.0)],
+    );
+    assert_eq!(steps(&s), n, "two clicks record no undo step");
+    gesture(&mut s, &[(PointerKind::DoubleClick, 150.0, 88.0)]);
+    assert_eq!(pie(&s), (0.0, 360.0));
+    assert_eq!(steps(&s), n + 1);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert!(near(pie(&s), (90.0, 270.0)));
+}
+
 /// #812: a polygon's Polygon Properties: its angle, radius and side length, each one undo step;
 /// Make Sides Equal after an uneven scale; bad values are errors.
 #[test]
@@ -368,4 +461,27 @@ fn a_polygon_takes_its_angle_radius_side_length_and_equal_sides() {
     for bad in [json!({"polygonRadius": 0}), json!({"sideLength": -3}), json!({"polygonRadius": "big"}), json!({"polygonAngle": "left"})] {
         assert!(s.execute("object.setLiveShape", &bad).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn relative_corner_rounding_keeps_fraction_on_resize() {
+    let (mut s, id) = session();
+    run(&mut s, json!({"relativeRadii": true}));
+    let n = s.doc().unwrap().doc.node(id).unwrap();
+    let c = LiveCorners::of(n).unwrap();
+    let max = c.corner(0).unwrap().max_radius();
+    let want = 0.25;
+    run(&mut s, json!({"radius": want * max}));
+    let n = s.doc().unwrap().doc.node(id).unwrap();
+    let LiveShape::Rectangle { radii, radii_relative, .. } = n.live_shape().unwrap() else { panic!() };
+    assert!(radii_relative);
+    assert!((radii[0] - want).abs() < 0.02, "stored fraction: {}", radii[0]);
+    let drawn = LiveCorners::of(n).unwrap().drawn_radius(0);
+    s.execute("object.scale", &json!({"sx": 200, "sy": 200, "corners": true})).unwrap();
+    let n = s.doc().unwrap().doc.node(id).unwrap();
+    let LiveShape::Rectangle { radii, radii_relative, .. } = n.live_shape().unwrap() else { panic!() };
+    assert!(radii_relative);
+    assert!((radii[0] - want).abs() < 0.02, "fraction unchanged after scale: {}", radii[0]);
+    let c = LiveCorners::of(n).unwrap();
+    assert!((c.drawn_radius(0) / drawn - 2.0).abs() < 0.05, "drawn radius doubled with the shape");
 }

@@ -5,12 +5,15 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use hayro_syntax::Pdf;
-use hayro_syntax::object::{Array, Dict, Object, ObjectIdentifier, Stream, String as PdfString};
+use craft_pdf::syntax::Pdf;
+use craft_pdf::syntax::object::{Array, Dict, Object, ObjectIdentifier, Stream, String as PdfString};
+use craft_pdf::write::backend as krilla;
 use krilla::embed::{AssociationKind, EmbeddedFile, MimeType};
 use krilla::metadata::DateTime;
 
 use crate::PdfError;
+use crate::import_color::items;
+use crate::import_scan::text_string;
 use crate::lab_spot::find;
 
 /// The embedded file holding the native document (its name among the PDF's attachments).
@@ -82,8 +85,9 @@ pub(crate) fn editing_in(pdf: &Pdf) -> Option<Editing> {
     let files = spec.get::<Dict<'_>>(b"EF")?;
     let stream = files.get::<Stream<'_>>(b"F").or_else(|| files.get::<Stream<'_>>(b"UF"))?;
     let data = stream.decoded().map(|d| d.into_owned()).unwrap_or_default();
-    // The hash ends the description; editing data described otherwise is trusted.
-    let desc = spec.get::<PdfString<'_>>(b"Desc").map(|d| String::from_utf8_lossy(d.as_bytes()).into_owned()).unwrap_or_default();
+    // The hash ends the description (a text string, in any of its encodings); editing data
+    // described otherwise is trusted.
+    let desc = spec.get::<PdfString<'_>>(b"Desc").map(|d| text_string(d.as_bytes())).unwrap_or_default();
     let intact = match desc.rsplit_once("hash ") {
         Some((_, hash)) => hash.trim() == page_hash(pdf),
         None => true,
@@ -109,7 +113,7 @@ fn editing_spec<'a>(node: &Dict<'a>, depth: usize, seen: &mut HashSet<ObjectIden
     }
     let kids = node.get::<Array<'a>>(b"Kids")?;
     // Only a referenced kid can be shared (a direct kid's `obj_id` is the object holding it).
-    kids.raw_iter().zip(kids.iter::<Dict<'a>>()).find_map(|(raw, kid)| {
+    items(&kids).zip(kids.iter::<Dict<'a>>()).find_map(|(raw, kid)| {
         if raw.as_obj_ref().is_some_and(|r| !seen.insert(r.into())) {
             return None;
         }
@@ -117,11 +121,12 @@ fn editing_spec<'a>(node: &Dict<'a>, depth: usize, seen: &mut HashSet<ObjectIden
     })
 }
 
-/// A file specification naming the editing file (current or legacy name).
+/// A file specification naming the editing file (current or legacy name), in any text string
+/// encoding.
 fn is_editing_file(spec: &Dict<'_>) -> bool {
     [&b"UF"[..], b"F"].into_iter().filter_map(|k| spec.get::<PdfString<'_>>(k)).any(|name| {
-        let name = name.as_bytes();
-        name == EDITING_FILE.as_bytes() || name == LEGACY_EDITING_FILE.as_bytes()
+        let name = text_string(name.as_bytes());
+        name == EDITING_FILE || name == LEGACY_EDITING_FILE
     })
 }
 

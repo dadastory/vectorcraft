@@ -1,12 +1,15 @@
 //! Paragraph panel: seven alignment buttons, Paragraph Direction (with the Indic options), indents,
-//! space before/after, Hyphenate, Mojikumi Set and Kinsoku Set (with the East Asian options); the panel menu
-//! picks the Single-line or Every-line Composer.
+//! space before/after, Hyphenate, Insert Kashidas (with the Indic options), Mojikumi Set and Kinsoku
+//! Set (with the East Asian options); the panel menu turns Roman Hanging Punctuation on and off,
+//! opens Justification… and Hyphenation… and picks the Single-line or Every-line Composer.
 
 use egui::{Ui, vec2};
 use serde_json::{Value, json};
-use vectorcraft_doc::{Composer, Justify, NodeKind, ParaDirection, ParaStyle};
+use vectorcraft_doc::{
+    Composer, HyphenationOptions, JustificationOptions, Justify, Kinsoku, Mojikumi, NodeKind, ParaDirection, ParaStyle, SingleWordJustify,
+};
 
-use super::character::text_style;
+use super::character::{Metric, Shared, text_style};
 use super::{pstate, set_pstate};
 use crate::VectorcraftApp;
 use crate::theme::Tokens;
@@ -46,14 +49,19 @@ pub(crate) fn align(app: &mut VectorcraftApp, justify: &str) -> Result<Value, St
     Ok(Value::Null)
 }
 
-fn para_cmd(app: &mut VectorcraftApp, cmd: &str, mut p: Value) {
+fn para_cmd(app: &mut VectorcraftApp, cmd: &str, p: Value) {
+    run_on_paragraphs(app, cmd, p).ok();
+}
+
+/// Run `cmd` on the paragraphs the Paragraph panel acts on ([`format`]) and return its result.
+pub(crate) fn run_on_paragraphs(app: &mut VectorcraftApp, cmd: &str, mut p: Value) -> Result<Value, String> {
     if let Some((id, a, b)) = super::character::text_editing(app) {
         super::character::end_typing(app);
         p["ids"] = json!([id.0]);
         p["start"] = json!(a);
         p["end"] = json!(b);
     }
-    app.run(cmd, p).ok();
+    app.run(cmd, p)
 }
 
 /// Does the paragraph being edited (at the caret), else the selected text's first paragraph, run
@@ -136,6 +144,86 @@ fn collect_text_alignment(text: &vectorcraft_doc::TextObject, range: Option<(usi
     record(index, &plain, start, end) // Includes empty text and the paragraph after a final newline.
 }
 
+/// Visit every paragraph the Paragraph panel acts on.
+fn visit_paragraphs(app: &VectorcraftApp, mut f: impl FnMut(&ParaStyle)) {
+    let Some(st) = app.session.active() else { return };
+    if let Some((id, a, b)) = super::character::text_editing(app)
+        && let Some(NodeKind::Text(text)) = st.doc.node(id).map(|n| &n.kind)
+    {
+        let range = text.paragraphs_in(a, b);
+        for i in range {
+            f(text.para_at(i));
+        }
+        return;
+    }
+    for node in st.selection.objects.iter().filter_map(|id| st.doc.node(*id)) {
+        node.walk(&mut |c| {
+            if let NodeKind::Text(t) = &c.kind {
+                for i in 0..t.paragraph_count() {
+                    f(t.para_at(i));
+                }
+            }
+        });
+    }
+}
+
+/// A distance shared by every paragraph in scope, or `None` when they differ (blank spin field).
+fn shared_para_field(app: &VectorcraftApp, field: impl Fn(&ParaStyle) -> f64) -> Option<f64> {
+    let mut acc = Shared::None;
+    let mut any = false;
+    visit_paragraphs(app, |p| {
+        any = true;
+        acc.add(Metric(field(p)));
+    });
+    if !any {
+        return text_style(app).map(|(_, p)| field(&p));
+    }
+    acc.value().map(|m| m.0)
+}
+
+/// A justification option shared by every paragraph in scope, or `None` when they differ.
+pub(crate) fn shared_justification_f64(app: &VectorcraftApp, f: impl Fn(&JustificationOptions) -> f64) -> Option<f64> {
+    let mut acc = Shared::None;
+    let mut any = false;
+    visit_paragraphs(app, |p| {
+        any = true;
+        acc.add(Metric(f(&p.justification)));
+    });
+    if !any {
+        return text_style(app).map(|(_, p)| f(&p.justification));
+    }
+    acc.value().map(|m| m.0)
+}
+
+/// Single Word Justification shared by every paragraph in scope, or `None` when they differ.
+pub(crate) fn shared_single_word_justify(app: &VectorcraftApp) -> Option<SingleWordJustify> {
+    shared_para(app, |p| p.justification.single_word)
+}
+
+/// A paragraph attribute shared by every paragraph in scope, or `None` when they differ.
+fn shared_para<T: PartialEq + Copy>(app: &VectorcraftApp, field: impl Fn(&ParaStyle) -> T) -> Option<T> {
+    let mut acc = Shared::None;
+    let mut any = false;
+    visit_paragraphs(app, |p| {
+        any = true;
+        acc.add(field(p));
+    });
+    if !any {
+        return text_style(app).map(|(_, p)| field(&p));
+    }
+    acc.value()
+}
+
+/// The composer every paragraph in scope shares, or `None` when they differ (neither menu item checked).
+fn shared_composer(app: &VectorcraftApp) -> Option<Composer> {
+    shared_para(app, |p| p.composer)
+}
+
+/// Hyphenation shared by every paragraph in scope, or `None` when they differ (checkbox off).
+fn shared_hyphenate(app: &VectorcraftApp) -> Option<bool> {
+    shared_para(app, |p| p.hyphenate)
+}
+
 /// None means differing displayed alignments, following the other mixed-value controls.
 fn selected_alignment(app: &VectorcraftApp, fallback: &ParaStyle) -> Option<Justify> {
     let default = Some(shown_alignment(fallback.justify, fallback.direction == Some(ParaDirection::RightToLeft)));
@@ -171,10 +259,11 @@ pub fn alignment_buttons(app: &mut VectorcraftApp, ui: &mut Ui, para: &ParaStyle
     }
 }
 
-/// The Hyphenate checkbox of `para`'s paragraphs.
-pub fn hyphenate_check(app: &mut VectorcraftApp, ui: &mut Ui, para: &ParaStyle) {
-    if widgets::check(ui, tl!("Hyphenate"), para.hyphenate, true) {
-        format(app, json!({"hyphenate": !para.hyphenate}));
+/// The Hyphenate checkbox for the paragraphs the panel acts on.
+pub fn hyphenate_check(app: &mut VectorcraftApp, ui: &mut Ui, _para: &ParaStyle) {
+    let hyphenate = shared_hyphenate(app);
+    if widgets::check(ui, tl!("Hyphenate"), hyphenate == Some(true), true) {
+        format(app, json!({"hyphenate": hyphenate != Some(true)}));
     }
 }
 
@@ -211,27 +300,27 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     };
     egui::Grid::new("para-grid").num_columns(4).spacing([4.0, 4.0]).show(ui, |ui| {
         label(ui, "→|", tl!("Left Indent"));
-        if let Some(v) = widgets::spin_field(ui, "pa-li", Some(para.left_indent), unit, fw, 1.0, -1296.0, &[]) {
+        if let Some(v) = widgets::spin_field(ui, "pa-li", shared_para_field(app, |p| p.left_indent), unit, fw, 1.0, -1296.0, &[]) {
             format(app, json!({"leftIndent": v}));
         }
         label(ui, "|←", tl!("Right Indent"));
-        if let Some(v) = widgets::spin_field(ui, "pa-ri", Some(para.right_indent), unit, fw, 1.0, -1296.0, &[]) {
+        if let Some(v) = widgets::spin_field(ui, "pa-ri", shared_para_field(app, |p| p.right_indent), unit, fw, 1.0, -1296.0, &[]) {
             format(app, json!({"rightIndent": v}));
         }
         ui.end_row();
         label(ui, "1→", tl!("First-line Left Indent"));
-        if let Some(v) = widgets::spin_field(ui, "pa-fi", Some(para.first_line_indent), unit, fw, 1.0, -1296.0, &[]) {
+        if let Some(v) = widgets::spin_field(ui, "pa-fi", shared_para_field(app, |p| p.first_line_indent), unit, fw, 1.0, -1296.0, &[]) {
             format(app, json!({"firstLineIndent": v}));
         }
         ui.label("");
         ui.label("");
         ui.end_row();
         label(ui, "↑¶", tl!("Space Before Paragraph"));
-        if let Some(v) = widgets::spin_field(ui, "pa-sb", Some(para.space_before), unit, fw, 1.0, 0.0, &[]) {
+        if let Some(v) = widgets::spin_field(ui, "pa-sb", shared_para_field(app, |p| p.space_before), unit, fw, 1.0, 0.0, &[]) {
             format(app, json!({"spaceBefore": v}));
         }
         label(ui, "↓¶", tl!("Space After Paragraph"));
-        if let Some(v) = widgets::spin_field(ui, "pa-sa", Some(para.space_after), unit, fw, 1.0, 0.0, &[]) {
+        if let Some(v) = widgets::spin_field(ui, "pa-sa", shared_para_field(app, |p| p.space_after), unit, fw, 1.0, 0.0, &[]) {
             format(app, json!({"spaceAfter": v}));
         }
         ui.end_row();
@@ -241,12 +330,38 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         return;
     }
     hyphenate_check(app, ui, &para);
+    // How long the kashidas are that justify Arabic lines, with the Middle Eastern (Indic) options.
+    if app.session.prefs.show_indic_options {
+        ui.horizontal(|ui| {
+            use vectorcraft_doc::text::Kashida;
+            widgets::dim_label(ui, tl!("Insert Kashidas"));
+            let kinds = [
+                (tl!("None"), Kashida::None, "none"),
+                (tl!("Short"), Kashida::Short, "short"),
+                (tl!("Medium"), Kashida::Medium, "medium"),
+                (tl!("Long"), Kashida::Long, "long"),
+                (tl!("Stylistic"), Kashida::Stylistic, "stylistic"),
+            ];
+            let names = kinds.map(|k| k.0);
+            let current = kinds.iter().find(|k| k.1 == para.kashida).map_or(names[0], |k| k.0);
+            // Already translated: shown as they are.
+            if let Some(i) = widgets::dropdown_names(ui, "pa-kashida", current, &names, ui.available_width() - 4.0)
+                && let Some((_, _, key)) = kinds.get(i)
+            {
+                format(app, json!({"kashida": key}));
+            }
+        });
+    }
     // Japanese composition: how punctuation is spaced (JLREQ 3.1), with the East Asian options.
     if app.session.prefs.show_east_asian_options {
         ui.horizontal(|ui| {
             widgets::dim_label(ui, tl!("Mojikumi Set"));
             let sets = [tl!("None"), tl!("Line-end Punctuation Half Width")];
-            let current = if para.mojikumi == vectorcraft_doc::Mojikumi::LineEndHalf { sets[1] } else { sets[0] };
+            let current = match shared_para(app, |p| p.mojikumi) {
+                Some(Mojikumi::LineEndHalf) => sets[1],
+                Some(Mojikumi::None) => sets[0],
+                None => "",
+            };
             // Already translated: shown as they are.
             if let Some(i) = widgets::dropdown_names(ui, "pa-mojikumi", current, &sets, ui.available_width() - 4.0) {
                 format(app, json!({"mojikumi": if i == 1 { "lineEndHalf" } else { "none" }}));
@@ -254,11 +369,10 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         });
         // Which characters may not start or end a line.
         ui.horizontal(|ui| {
-            use vectorcraft_doc::Kinsoku;
             widgets::dim_label(ui, tl!("Kinsoku Set"));
             let sets = [(tl!("None"), Kinsoku::None, "none"), (tl!("Hard"), Kinsoku::Hard, "hard"), (tl!("Soft"), Kinsoku::Soft, "soft")];
             let names = sets.map(|s| s.0);
-            let current = sets.iter().find(|s| s.1 == para.kinsoku).map_or(names[1], |s| s.0);
+            let current = shared_para(app, |p| p.kinsoku).and_then(|k| sets.iter().find(|s| s.1 == k).map(|s| s.0)).unwrap_or("");
             // Already translated: shown as they are.
             if let Some(i) = widgets::dropdown_names(ui, "pa-kinsoku", current, &names, ui.available_width() - 4.0)
                 && let Some((_, _, key)) = sets.get(i)
@@ -277,8 +391,20 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
         set_pstate(ui.ctx(), "pa-hide-options", !hidden);
     }
     ui.separator();
-    for l in [tl!("Roman Hanging Punctuation"), tl!("Justification…"), tl!("Hyphenation…")] {
-        menu_item(ui, l, false, false);
+    // Quotation marks, hyphens, full stops and commas at a line's ends hang outside the margin.
+    let roman = style.as_ref().is_some_and(|(_, p)| p.roman_hanging);
+    if menu_item(ui, tl!("Roman Hanging Punctuation"), has, roman) {
+        format(app, json!({"romanHangingPunctuation": !roman}));
+    }
+    if menu_item(ui, tl!("Justification…"), has, false)
+        && let Err(e) = app.run("ui.justification", json!({}))
+    {
+        app.status(e);
+    }
+    if menu_item(ui, tl!("Hyphenation…"), has, false)
+        && let Err(e) = app.run("ui.hyphenation", json!({}))
+    {
+        app.status(e);
     }
     // How leading is measured (Japanese layout measures it from em box top to em box top), with
     // the East Asian options.
@@ -310,7 +436,7 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
         });
     }
     ui.separator();
-    let composer = style.as_ref().map(|(_, p)| p.composer);
+    let composer = shared_composer(app);
     for (c, label, id) in
         [(Composer::SingleLine, tl!("Single-line Composer"), "singleLine"), (Composer::EveryLine, tl!("Every-line Composer"), "everyLine")]
     {
@@ -320,12 +446,30 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     }
     ui.separator();
     if menu_item(ui, tl!("Reset Panel"), has, false) {
-        para_cmd(app, "text.setStyle", json!({"justify": "auto"}));
-        format(
-            app,
-            json!({"leftIndent": 0, "rightIndent": 0, "firstLineIndent": 0, "spaceBefore": 0, "spaceAfter": 0, "hyphenate": false, "direction": "auto", "leadingModel": "romanBaseline", "burasagari": "standard", "kinsoku": "hard", "composer": "everyLine"}),
-        );
+        reset_panel(app);
     }
+}
+
+/// Reset Panel: the paragraphs the panel acts on ([`format`]) take Auto alignment, no indents or
+/// paragraph spacing, Hyphenate off with the default Hyphenation and Justification options, Auto
+/// direction, Bottom-to-Bottom Leading, Regular burasagari, the Hard kinsoku set, the Every-line
+/// Composer, Roman Hanging Punctuation off and no kashidas.
+fn reset_panel(app: &mut VectorcraftApp) {
+    let h = HyphenationOptions::default();
+    let j = vectorcraft_doc::JustificationOptions::default();
+    para_cmd(app, "text.setStyle", json!({"justify": "auto"}));
+    format(
+        app,
+        json!({
+            "leftIndent": 0, "rightIndent": 0, "firstLineIndent": 0, "spaceBefore": 0, "spaceAfter": 0, "hyphenate": false,
+            "wordsLongerThan": h.words_longer_than, "afterFirst": h.after_first, "beforeLast": h.before_last,
+            "hyphenLimit": h.hyphen_limit, "hyphenationZone": h.zone, "hyphenateCapitalized": h.capitalized, "kashida": "none",
+            "wordSpacing": j.word_spacing, "letterSpacing": j.letter_spacing, "glyphScaling": j.glyph_scaling,
+            "autoLeading": j.auto_leading, "singleWordJustification": "fullJustify",
+            "direction": "auto", "leadingModel": "romanBaseline", "burasagari": "standard", "kinsoku": "hard", "composer": "everyLine",
+            "romanHangingPunctuation": false
+        }),
+    );
 }
 
 #[cfg(test)]
@@ -382,6 +526,59 @@ mod tests {
 
     fn select_range(app: &mut VectorcraftApp, start: usize, end: usize) {
         app.session.set_tool_option("select", &json!({"start": start, "end": end}));
+    }
+
+    #[test]
+    fn paragraph_mixed_composer_checks_neither_menu_item() {
+        let (mut app, id) = editing_text("A\nB\n");
+        app.run("text.setFormat", json!({"id": id, "composer": "singleLine"})).unwrap();
+        app.run("text.setFormat", json!({"id": id, "start": 2, "end": 3, "composer": "everyLine"})).unwrap();
+        app.session.set_tool_option("selectAll", &json!(true));
+        assert_eq!(shared_composer(&app), None);
+        app.run("text.setFormat", json!({"id": id, "composer": "everyLine"})).unwrap();
+        assert_eq!(shared_composer(&app), Some(Composer::EveryLine));
+    }
+
+    #[test]
+    fn paragraph_mixed_hyphenate_checks_off() {
+        let (mut app, id) = editing_text("A\nB\n");
+        app.run("text.setFormat", json!({"id": id, "hyphenate": true})).unwrap();
+        app.run("text.setFormat", json!({"id": id, "start": 2, "end": 3, "hyphenate": false})).unwrap();
+        app.session.set_tool_option("selectAll", &json!(true));
+        assert_eq!(shared_hyphenate(&app), None);
+        app.run("text.setFormat", json!({"id": id, "hyphenate": true})).unwrap();
+        assert_eq!(shared_hyphenate(&app), Some(true));
+    }
+
+    #[test]
+    fn paragraph_mixed_kinsoku_and_mojikumi_show_blank_dropdowns() {
+        let (mut app, id) = editing_text("A\nB\n");
+        app.session.prefs.show_east_asian_options = true;
+        app.run("text.setFormat", json!({"id": id, "kinsoku": "hard", "mojikumi": "none"})).unwrap();
+        app.run("text.setFormat", json!({"id": id, "start": 2, "end": 3, "kinsoku": "soft", "mojikumi": "lineEndHalf"})).unwrap();
+        app.session.set_tool_option("selectAll", &json!(true));
+        assert_eq!(shared_para(&app, |p| p.kinsoku), None);
+        assert_eq!(shared_para(&app, |p| p.mojikumi), None);
+        app.run("text.setFormat", json!({"id": id, "kinsoku": "hard", "mojikumi": "lineEndHalf"})).unwrap();
+        assert_eq!(shared_para(&app, |p| p.kinsoku), Some(Kinsoku::Hard));
+        assert_eq!(shared_para(&app, |p| p.mojikumi), Some(Mojikumi::LineEndHalf));
+    }
+
+    #[test]
+    fn paragraph_mixed_indent_fields_show_blank() {
+        let (mut app, id) = editing_text("A\nB\n");
+        app.run("text.setFormat", json!({"id": id, "leftIndent": 10})).unwrap();
+        app.run("text.setFormat", json!({"id": id, "start": 2, "end": 3, "leftIndent": 20})).unwrap();
+        app.session.set_tool_option("selectAll", &json!(true));
+        assert_eq!(shared_para_field(&app, |p| p.left_indent), None);
+        assert_eq!(shared_para_field(&app, |p| p.space_before), Some(0.0));
+        app.run("text.setFormat", json!({"id": id, "leftIndent": 12})).unwrap();
+        assert_eq!(shared_para_field(&app, |p| p.left_indent), Some(12.0));
+        app.session.set_tool_option("stopEditing", &json!(true));
+        let other = app.run("text.create", json!({"x": 40, "y": 80, "text": "C"})).unwrap()["id"].clone();
+        app.run("text.setFormat", json!({"id": other, "leftIndent": 5})).unwrap();
+        app.run("select.set", json!({"ids": [id, other]})).unwrap();
+        assert_eq!(shared_para_field(&app, |p| p.left_indent), None);
     }
 
     #[test]
@@ -549,5 +746,68 @@ mod tests {
         let without = tips(&mut app);
         app.session.prefs.show_indic_options = true;
         assert!(tips(&mut app) > without, "two more buttons");
+    }
+
+    /// Insert Kashidas is in the panel with the Middle Eastern (Indic) options only, shows the
+    /// paragraph's setting, and Reset Panel sets it back to None.
+    #[test]
+    fn insert_kashidas_shows_with_the_indic_options_and_reset_panel_turns_it_off() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 400, "height": 200})).unwrap();
+        let id = app.run("text.create", json!({"x": 20, "y": 50, "text": "كتب محمد"})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [id]})).unwrap();
+        crate::i18n::set_current(crate::i18n::Lang::EN);
+        let painted = |app: &mut VectorcraftApp| crate::tests_labels::painted_text(app, show);
+        assert!(!painted(&mut app).contains("Insert Kashidas"));
+        app.session.prefs.show_indic_options = true;
+        let text = painted(&mut app);
+        assert!(text.contains("Insert Kashidas") && text.contains("None"), "{text}");
+        app.run("text.setFormat", json!({"kashida": "medium"})).unwrap();
+        assert!(painted(&mut app).contains("Medium"));
+        let kashida = |app: &VectorcraftApp| {
+            let node = app.session.active().unwrap().doc.node(vectorcraft_doc::NodeId(id.as_u64().unwrap())).unwrap();
+            let NodeKind::Text(text) = &node.kind else { panic!("text") };
+            text.para_at(0).kashida
+        };
+        assert_eq!(kashida(&app), vectorcraft_doc::text::Kashida::Medium);
+        reset_panel(&mut app);
+        assert_eq!(kashida(&app), vectorcraft_doc::text::Kashida::None);
+    }
+
+    /// Reset Panel turns Hyphenate and Roman Hanging Punctuation off and sets the Hyphenation and
+    /// Justification options back to their defaults in every paragraph it acts on, so the paragraphs
+    /// save neither.
+    #[test]
+    fn reset_panel_resets_the_hyphenation_options() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 400, "height": 200})).unwrap();
+        let id = app.run("text.create", json!({"x": 20, "y": 50, "text": "First\nSecond"})).unwrap()["id"].clone();
+        app.run(
+            "text.setFormat",
+            json!({
+                "hyphenate": true, "wordsLongerThan": 8, "afterFirst": 2, "beforeLast": 4, "hyphenLimit": 2, "hyphenationZone": 18, "hyphenateCapitalized": false,
+                "wordSpacing": [60, 90, 200], "letterSpacing": [-5, 0, 5], "glyphScaling": [95, 100, 105], "autoLeading": 150, "singleWordJustification": "alignLeft", "romanHangingPunctuation": true
+            }),
+        )
+        .unwrap();
+        let paras = |app: &VectorcraftApp| {
+            let node = app.session.active().unwrap().doc.node(vectorcraft_doc::NodeId(id.as_u64().unwrap())).unwrap();
+            let NodeKind::Text(text) = &node.kind else { panic!("text") };
+            [text.para_at(0).clone(), text.para_at(1).clone()]
+        };
+        for para in paras(&app) {
+            assert!(para.hyphenate);
+            assert_ne!(para.hyphenation, HyphenationOptions::default());
+            assert!(para.roman_hanging);
+            assert_ne!(para.justification, vectorcraft_doc::JustificationOptions::default());
+        }
+        reset_panel(&mut app);
+        for para in paras(&app) {
+            assert!(!para.hyphenate);
+            assert_eq!(para.hyphenation, HyphenationOptions::default());
+            assert_eq!(serde_json::to_value(&para).unwrap().get("hyphenation"), None, "saves no hyphenation options");
+            assert!(!para.roman_hanging, "Roman Hanging Punctuation off");
+            assert_eq!(serde_json::to_value(&para).unwrap().get("justification"), None, "saves no justification options");
+        }
     }
 }

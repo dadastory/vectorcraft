@@ -14,9 +14,11 @@
 //!
 //! Where type sits: a story lays its lines out round a point `F` (the anchor: the start of a line of
 //! left-aligned type, the middle of a centred one, the end of a right-aligned one), each line with an
-//! offset from it. The frame of the story gives a matrix that carries that layout onto the canvas of
-//! the app, which is 16383 points a side; the canvas's centre, 8191.5, is the centre of the file's
-//! `%AI3_TemplateBox`. See [`Story::place`].
+//! offset from it. A right-to-left paragraph (key `33` of its attributes) swaps the two: its
+//! "left"-aligned lines end at the anchor and its "right"-aligned ones start there. The frame of the
+//! story gives a matrix that carries that layout onto the canvas of the app, which is 16383 points a
+//! side; the canvas's centre, 8191.5, is the centre of the file's `%AI3_TemplateBox`. See
+//! [`Story::place`].
 
 use std::collections::BTreeMap;
 
@@ -253,6 +255,9 @@ enum FrameKind {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Para {
     justify: u8,
+    /// A right-to-left paragraph: its left and right alignments are each other's (the line of
+    /// "left"-aligned type ends at its anchor).
+    rtl: bool,
     first_indent: f64,
     left_indent: f64,
     right_indent: f64,
@@ -357,7 +362,12 @@ impl Texts {
             (rest.is_empty() && !chunks.is_empty() && chunks.len() <= MAX_SEGMENTS).then(|| chunks.to_vec())
         };
         match carries.get("0").and_then(Val::num).unwrap_or(0.0) as i64 {
-            0 => Some(FrameKind::Point(carries.get("2")?.nums()?.try_into().ok()?)),
+            // Point type that is neither turned nor scaled has no matrix (Illustrator 24 leaves it out):
+            // its layout is already where it goes on the canvas.
+            0 => Some(FrameKind::Point(match carries.get("2") {
+                None => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                Some(m) => m.nums()?.try_into().ok()?,
+            })),
             1 => Some(FrameKind::Area(segments()?)),
             2 => {
                 let range = carries.get("6").and_then(Val::nums).unwrap_or_default();
@@ -429,6 +439,7 @@ impl Texts {
         let num = |k: &str| pick(k).and_then(Val::num).filter(|v| v.abs() < 1e5).unwrap_or(0.0);
         Para {
             justify: pick("0").and_then(Val::num).map_or(0, |v| v.clamp(0.0, 6.0) as u8),
+            rtl: pick("33").and_then(Val::num) == Some(1.0),
             first_indent: num("1"),
             left_indent: num("2"),
             right_indent: num("3"),
@@ -550,6 +561,11 @@ impl Story {
         self.text.len()
     }
 
+    /// The story's characters, with `\r` ending paragraphs and `\x03` ending lines.
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+
     /// The point frame's matrix (the first frame's, when it is one), else the identity.
     fn matrix(&self) -> [f64; 6] {
         match self.frames.first() {
@@ -583,7 +599,7 @@ impl Story {
     /// Roughly where the story's type lies on the document: its frame's box, or round its lines
     /// for point type (what the page draws of it lies there).
     pub(super) fn region(&self, template: (f64, f64), to_doc: Affine) -> Option<Rect> {
-        let size = self.runs.iter().map(|(_, s)| s.size).fold(0.0, f64::max);
+        let size = self.runs.iter().map(|(_, s)| s.size).fold(0.0, f64::max) * art_scale(to_doc);
         let bounds = |segments: &[[f64; 8]]| path_of(segments, template, to_doc).bounds();
         let r = match self.frames.first()? {
             FrameKind::Area(s) => bounds(s)?,
@@ -634,6 +650,9 @@ impl Story {
         if text.trim().is_empty() && !threaded {
             return None;
         }
+        // The text document measures in the art's units too: the document's scale carries its
+        // sizes and spacings onto the page (a Large Canvas copy is written at 1:10; #2031).
+        let scale = scale * art_scale(to_doc);
         let leading = self.line_leading(scale);
         let chars: Vec<char> = text.chars().collect();
         let mut runs = vec![];
@@ -739,6 +758,8 @@ impl Story {
 fn para_style(p: &Para, scale: f64) -> ParaStyle {
     ParaStyle {
         justify: match p.justify {
+            0 if p.rtl => Justify::Right,
+            1 if p.rtl => Justify::Left,
             1 => Justify::Right,
             2 => Justify::Center,
             3 => Justify::JustifyLeft,
@@ -776,9 +797,30 @@ fn char_style(s: &Style, scale: f64, leading: Option<f64>) -> CharStyle {
     }
 }
 
+/// How many document points one unit of the art is: `to_doc`'s scale, which carries the art's
+/// lengths onto the document (10 for a Large Canvas copy written at 1:10; see `ai::read`).
+fn art_scale(to_doc: Affine) -> f64 {
+    let [a, b, ..] = to_doc.as_coeffs();
+    (a * a + b * b).sqrt().max(1e-9)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn right_to_left_paragraphs_swap_left_and_right_alignment() {
+        let texts =
+            Texts { stories: vec![], fonts: vec![], defaults: Val::Dict(BTreeMap::new()), para_defaults: read(b"/33 1").unwrap(), frames: vec![] };
+        let justify = |own: &[u8]| para_style(&texts.para(Some(&read(own).unwrap())), 1.0).justify;
+        // Right to left from the document's defaults, or the paragraph's own.
+        assert_eq!(justify(b"/0 0"), Justify::Right);
+        assert_eq!(justify(b"/0 1 /33 1"), Justify::Left);
+        assert_eq!(justify(b"/0 2"), Justify::Center);
+        // Left to right keeps them.
+        assert_eq!(justify(b"/0 0 /33 0"), Justify::Left);
+        assert_eq!(justify(b"/0 1 /33 0"), Justify::Right);
+    }
 
     #[test]
     fn values_read_nested_dictionaries_lists_and_utf16_strings() {
@@ -850,6 +892,22 @@ mod tests {
         let s = story("one\rtwo\r", &[0.0, 20.0], &para);
         assert!((s.line_leading(1.0).unwrap() - 14.0).abs() < 1e-9);
         assert!((s.line_leading(0.5).unwrap() - 7.0).abs() < 1e-9);
+    }
+
+    /// #2031: a Large Canvas editing copy measures its text document in its art's units, a tenth
+    /// of the page's: the story's size and leading reach the page through `to_doc`'s scale.
+    #[test]
+    fn a_story_in_a_scaled_art_space_keeps_its_size_and_leading() {
+        let s = story("one\rtwo\r", &[0.0, 20.0], &Para::default());
+        // A copy written at 1:10 (see `ai::read::ensure_space`): its art's units reach the
+        // document, 100 points to the page, through `to_doc`'s scale.
+        let to_doc = Affine::scale(10.0) * Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, 100.0]);
+        let t = match s.node(NodeId(1), 0, (0.0, 0.0), to_doc).unwrap().kind {
+            NodeKind::Text(t) => t,
+            _ => panic!("not text"),
+        };
+        assert_eq!(t.runs[0].style.size, 130.0, "13 pt at the page's scale");
+        assert_eq!(t.runs[0].style.leading, Some(200.0), "a 20-unit line pitch at the page's scale");
     }
 
     #[test]

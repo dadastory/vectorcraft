@@ -12,6 +12,7 @@ pub mod colortheme;
 mod create;
 mod css;
 mod cut;
+pub(crate) mod dimension;
 pub(crate) mod distortcmds;
 mod docinfo;
 mod docmenu;
@@ -33,6 +34,8 @@ mod halftone;
 pub mod help;
 pub mod importmatches;
 pub(crate) mod inline;
+mod interactivity;
+mod intertwine;
 mod layer;
 mod layerpanel;
 pub mod library;
@@ -44,9 +47,10 @@ pub(crate) mod menucmds;
 pub(crate) mod newart;
 pub mod newdoc;
 mod object;
+pub(crate) mod objects_on_path;
 mod opacitymask;
 mod overprint;
-mod package;
+pub mod package;
 mod paint;
 mod panelcmds;
 pub mod params;
@@ -178,6 +182,10 @@ pub fn can_undo(s: &Session) -> std::result::Result<(), String> {
 pub fn can_redo(s: &Session) -> std::result::Result<(), String> {
     s.active().filter(|d| !d.history.redo.is_empty()).map(|_| ()).ok_or_else(|| "nothing to redo".into())
 }
+/// The active document has a step to undo or to redo (Clear History).
+pub fn can_clear_history(s: &Session) -> std::result::Result<(), String> {
+    s.active().filter(|d| !d.history.undo.is_empty() || !d.history.redo.is_empty()).map(|_| ()).ok_or_else(|| "no history to clear".into())
+}
 pub fn has_clipboard(s: &Session) -> std::result::Result<(), String> {
     has_doc(s)?;
     if s.clipboard.is_empty() { Err("clipboard is empty".into()) } else { Ok(()) }
@@ -202,6 +210,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(recolor::specs());
         v.extend(fileio::specs());
         v.extend(create::specs());
+        v.extend(dimension::specs());
         v.extend(object::specs());
         v.extend(path::specs());
         v.extend(select::specs());
@@ -247,6 +256,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(shaper::specs());
         v.extend(brushsym::specs());
         v.extend(patterncmds::specs());
+        v.extend(intertwine::specs());
+        v.extend(objects_on_path::specs());
         v.extend(prefscmds::specs());
         v.extend(distortcmds::specs());
         v.extend(paint::proxy_specs());
@@ -258,6 +269,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(library::specs());
         v.extend(expand::specs());
         v.extend(attributes::specs());
+        v.extend(interactivity::specs());
         v.extend(newart::specs());
         v.extend(colortheme::specs());
         v.extend(fileio::pdf::specs());
@@ -305,8 +317,41 @@ pub(crate) fn f64_or(p: &Value, key: &str, default: f64) -> f64 {
 pub(crate) fn f64_req(p: &Value, key: &str, cmd: &str) -> Result<f64> {
     p.get(key).and_then(Value::as_f64).ok_or_else(|| bad(cmd, format!("missing number `{key}`")))
 }
+/// The number `p` gives for `key`, or `default` when `p` leaves it out or gives null. Any other
+/// value, such as `"40"`, is an error: "`{key}` must be a number, not {v}".
+pub(crate) fn number_or(p: &Value, key: &str, default: f64, cmd: &str) -> Result<f64> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_f64().ok_or_else(|| bad(cmd, format!("`{key}` must be a number, not {v}"))),
+    }
+}
+/// Error unless each of `keys` that `p` gives is a number (or null), as [`number_or`] reads them: an
+/// optional number read with [`f64_or`] would otherwise fall back to its default for a string such as
+/// `"60 mm"` (#1952).
+pub(crate) fn check_numbers(p: &Value, keys: &[&str], cmd: &str) -> Result<()> {
+    for key in keys {
+        number_or(p, key, 0.0, cmd)?;
+    }
+    Ok(())
+}
 pub(crate) fn bool_or(p: &Value, key: &str, default: bool) -> bool {
     p.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+/// The true or false `p` gives for `key`, or `default` when `p` leaves it out or gives null. Any
+/// other value, such as `"false"`, is an error: "`{key}` must be true or false".
+pub(crate) fn switch_or(p: &Value, key: &str, default: bool, cmd: &str) -> Result<bool> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_bool().ok_or_else(|| bad(cmd, format!("`{key}` must be true or false"))),
+    }
+}
+/// Error unless each of `keys` that `p` gives is true or false (or null), as [`switch_or`] reads
+/// them.
+pub(crate) fn check_switches(p: &Value, keys: &[&str], cmd: &str) -> Result<()> {
+    for key in keys {
+        switch_or(p, key, false, cmd)?;
+    }
+    Ok(())
 }
 pub(crate) fn str_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
     p.get(key).and_then(Value::as_str)
@@ -317,6 +362,10 @@ pub(crate) fn id_param(p: &Value, key: &str) -> Option<NodeId> {
 pub(crate) fn ids_param(p: &Value, key: &str) -> Option<Vec<NodeId>> {
     p.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(NodeId).collect())
 }
+/// `v` as an index, a count or a byte offset: past `usize::MAX` reads as `usize::MAX`, past the end of any list.
+pub(crate) fn index(v: u64) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
 /// Validate all explicit targets before a command changes the document or selection.
 pub(crate) fn checked_ids_param(s: &Session, p: &Value, key: &str, command: &str) -> Result<Vec<NodeId>> {
     let values =
@@ -324,9 +373,10 @@ pub(crate) fn checked_ids_param(s: &Session, p: &Value, key: &str, command: &str
     values.iter().map(|value| checked_id(s, value, command)).collect()
 }
 
-/// The objects a command acts on: `ids` when given (every one checked), else the selected objects.
+/// The objects a command acts on: `ids` when given (every one checked, and those inside another
+/// given one dropped), else the selected objects.
 pub(crate) fn checked_ids_or_selection(s: &Session, p: &Value, command: &str) -> Result<Vec<NodeId>> {
-    if p.get("ids").is_some() { checked_ids_param(s, p, "ids", command) } else { edit::selected_roots(s) }
+    if p.get("ids").is_some() { Ok(edit::outermost(&s.doc()?.doc, checked_ids_param(s, p, "ids", command)?)) } else { edit::selected_roots(s) }
 }
 
 pub(crate) fn checked_id(s: &Session, value: &Value, command: &str) -> Result<NodeId> {
@@ -461,6 +511,7 @@ pub(crate) fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
 }
 
 pub(crate) use edit::{settle_interaction, typing_in_progress};
+pub(crate) use object::bounds_rewrite;
 pub(crate) use vectorcraft_doc::range::parse_range;
 
 /// A date param in Unix seconds that defaults to the clock: `None` when absent (now, see
@@ -477,7 +528,7 @@ pub(crate) fn date_param(p: &Value, key: &str, cmd: &str) -> Result<Option<Optio
 /// no clock). It joins the running command's journal entry as `key`, so a replay of the journal
 /// gives the same date whenever it runs (an action leaves it out: [`crate::Session::journal_for_action`]).
 pub(crate) fn clock_date(s: &mut Session, key: &str, given: Option<Option<i64>>) -> Option<i64> {
-    let t = given.unwrap_or_else(vectorcraft_doc::metadata::now_unix);
+    let t = given.unwrap_or_else(vectorcraft_doc::metadata::output_time);
     s.note_journal(key, serde_json::json!(t));
     t
 }
@@ -499,6 +550,9 @@ pub use flatten::FlattenerPreset;
 
 /// The shapes a group selected alone gives the Pathfinder panel.
 pub use pathops::shape_count;
+
+/// The gaps View › Show Live Paint Gaps shows on a Live Paint group.
+pub use buildcmds::live_paint_gaps;
 
 /// Command ids kept only so older scripts keep working: `(alias, the command it duplicates)`.
 /// They run as before but the command palette leaves them out (it lists the command once).

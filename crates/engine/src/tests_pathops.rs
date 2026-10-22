@@ -205,6 +205,44 @@ fn a_group_selected_alone_is_combined_member_by_member() {
     assert_eq!((bounds.x0, bounds.x1), (0.0, 10.0), "the back member less the front one");
 }
 
+/// #2178: Unite on separated shapes is one compound path; Release releases each subpath (Illustrator parity).
+#[test]
+fn pathfinder_unite_non_overlapping_shapes_become_compound_path_releasable() {
+    let mut s = session();
+    let a = rect(&mut s, 0.0, 0.0, 20.0, 20.0);
+    let b = rect(&mut s, 30.0, 0.0, 20.0, 20.0);
+    let layer = s.doc().unwrap().doc.parent_of(a).unwrap();
+    s.execute("select.set", &json!({"ids": [a.0, b.0]})).unwrap();
+    s.execute("object.pathfinder.unite", &json!({})).unwrap();
+    let result = s.doc().unwrap().selection.objects[0];
+    let united = node(&s, result);
+    assert!(matches!(united.kind, NodeKind::Compound { .. }));
+    assert_eq!(united.children().unwrap().len(), 2);
+    s.execute("object.compoundPath.release", &json!({})).unwrap();
+    let d = &s.doc().unwrap().doc;
+    assert!(d.node(result).is_none());
+    assert_eq!(s.doc().unwrap().selection.len(), 2);
+    for id in &s.doc().unwrap().selection.objects {
+        assert_eq!(d.parent_of(*id), Some(layer));
+    }
+}
+
+/// #2178: Unite keeps disjoint geometry in one compound path (not a group of separate path objects).
+#[test]
+fn pathfinder_unite_disjoint_islands_stay_one_compound_path() {
+    let mut s = session();
+    let outer = rect(&mut s, 0.0, 0.0, 40.0, 40.0);
+    let hole = rect(&mut s, 10.0, 10.0, 10.0, 10.0);
+    s.execute("select.set", &json!({"ids": [outer.0, hole.0]})).unwrap();
+    let ring = NodeId(s.execute("object.compoundPath.make", &json!({})).unwrap()["id"].as_u64().unwrap());
+    let separate = rect(&mut s, 60.0, 0.0, 20.0, 20.0);
+    s.execute("select.set", &json!({"ids": [ring.0, separate.0]})).unwrap();
+    s.execute("object.pathfinder.unite", &json!({})).unwrap();
+    let result = s.doc().unwrap().selection.objects[0];
+    assert!(matches!(node(&s, result).kind, NodeKind::Compound { .. }));
+    assert_eq!(path_of(&s, result).0.subpaths.len(), 3);
+}
+
 #[test]
 fn unite_with_group() {
     let mut s = session();
@@ -446,6 +484,58 @@ fn simplify_dense_polyline() {
     assert!(after < before / 4, "{after}");
     assert_eq!(out["after"].as_u64().unwrap() as usize, after);
     assert!(close(bounds(&s, id), Rect::new(0.0, 60.0, 300.0, 140.0), 2.0));
+}
+
+/// A sine wave with an anchor every point over `width` pt, `amplitude` pt high and a wavelength of
+/// `2π × period` pt, its anchors `jag` pt above and below it in turn, selected: (the session, the
+/// path's id).
+fn dense_wave(width: u32, amplitude: f64, period: f64, jag: f64) -> (Session, NodeId) {
+    let mut s = session();
+    let y = |i: u32| 100.0 + amplitude * (f64::from(i) / period).sin() + if i.is_multiple_of(2) { jag } else { -jag };
+    let anchors: Vec<Value> = (0..=width).map(|i| json!({"x": f64::from(i), "y": y(i)})).collect();
+    let r = s.execute("path.create", &json!({"anchors": anchors})).unwrap();
+    (s, NodeId(r["id"].as_u64().unwrap()))
+}
+
+/// The Simplify slider: moving its level from 0 to 100 never lowers the anchor count, level 0
+/// leaves fewer anchors than level 100, and level 50 gives the 1 pt result.
+#[test]
+fn simplify_level_moves_the_anchor_count_monotonically() {
+    let (mut s, id) = dense_wave(300, 40.0, 25.0, 0.0);
+    let mut counts = vec![];
+    for level in (0..=100).step_by(10) {
+        let out = s.execute("object.path.simplify", &json!({ "level": level })).unwrap();
+        assert_eq!(out["level"], json!(f64::from(level)));
+        counts.push(path_of(&s, id).0.anchor_count());
+        s.execute("edit.undo", &json!({})).unwrap();
+    }
+    assert!(counts.windows(2).all(|w| w[0] <= w[1]), "{counts:?}");
+    assert!(counts[0] < counts[10], "{counts:?}");
+    s.execute("object.path.simplify", &json!({"tolerance": 1})).unwrap();
+    assert_eq!(path_of(&s, id).0.anchor_count(), counts[5], "level 50 is 1 pt");
+}
+
+/// Auto-Simplify picks the lowest level whose tolerance is at most 1/400 of the selection's longer
+/// side, and 11 sampled points on each segment of the original path stay that close to the result.
+#[test]
+fn auto_simplify_keeps_the_shape_within_a_400th_of_its_size() {
+    let (mut s, id) = dense_wave(100, 15.0, 8.0, 0.2);
+    let original = path_of(&s, id).0.clone();
+    let out = s.execute("object.path.simplify", &json!({"auto": true})).unwrap();
+    // 100 pt across: 0.25 pt at most, level 70 (0.25 pt).
+    assert_eq!(out["level"], json!(70.0));
+    let result = path_of(&s, id).0.clone();
+    assert!(result.anchor_count() < original.anchor_count() / 2, "{}", result.anchor_count());
+    // How far each point along the original lies from the nearest point of the result.
+    use vectorcraft_geom::ParamCurve;
+    use vectorcraft_geom::kurbo::ParamCurveNearest;
+    let fitted = &result.subpaths[0];
+    let off = |p: vectorcraft_geom::Point| {
+        (0..fitted.segment_count()).map(|i| fitted.segment(i).nearest(p, 1e-9).distance_sq.sqrt()).fold(f64::INFINITY, f64::min)
+    };
+    let sp = &original.subpaths[0];
+    let worst = (0..sp.segment_count()).flat_map(|i| (0..=10).map(move |k| sp.segment(i).eval(f64::from(k) / 10.0))).map(off).fold(0.0, f64::max);
+    assert!(worst <= 100.0 / 400.0, "{worst}");
 }
 
 /// How many steps there are to undo and to redo, and whether the document has unsaved changes.

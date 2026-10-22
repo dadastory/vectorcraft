@@ -2,6 +2,7 @@
 
 use egui::Ui;
 use serde_json::json;
+use vectorcraft_color::{Color, Paint};
 use vectorcraft_doc::{LiveShape, NodeKind, Unit};
 use vectorcraft_engine::cmd::newdoc;
 
@@ -10,6 +11,8 @@ use crate::theme::Tokens;
 use crate::widgets::{self, dim_label, divider, section_header};
 use crate::{VectorcraftApp, icons};
 
+/// The panel for what is selected: the selection's kind as its heading, then its sections (Edit
+/// Artboards' with the Artboard tool, the document's with nothing selected).
 pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let Some(st) = app.session.active() else {
@@ -38,6 +41,12 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         document_sections(app, ui);
         return;
     }
+    if n_sel == 1
+        && let Some(NodeKind::Group { clip: true, children }) = first.as_ref().map(|n| &n.kind)
+    {
+        clip_group_buttons(app, ui, children.len() > 1);
+        divider(ui);
+    }
     transform_section(app, ui);
     divider(ui);
     // The Gradient tool: the gradient's type and, for a freeform one, how clicks add points (#921).
@@ -58,6 +67,10 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     }
     if matches!(first.as_ref().map(|n| &n.kind), Some(NodeKind::Text(_))) {
         type_sections(app, ui);
+        divider(ui);
+    }
+    if crate::dialogs::dimension::selected(app).is_some() {
+        crate::dialogs::dimension::properties_section(app, ui);
         divider(ui);
     }
     appearance_section(app, ui);
@@ -134,6 +147,24 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     }
 }
 
+/// The one selected clip group's Edit Clipping Path and Edit Contents, at the top of the panel as in
+/// the reference app ("With the clip group selected, click the Edit Clipping Path button at the top
+/// of the Properties panel to select and edit the mask, or click the Edit Contents button to select
+/// and edit the masked content", <https://www.adobe.com/learn/illustrator/web/crop-using-masks>):
+/// they select its clipping path or its clipped art for the selection tools, as Object › Clipping
+/// Mask does. Edit Contents only when the group clips something.
+fn clip_group_buttons(app: &mut VectorcraftApp, ui: &mut Ui, has_contents: bool) {
+    let w = (ui.available_width() - 6.0) / 2.0;
+    ui.horizontal(|ui| {
+        if widgets::flat_button(ui, tl!("Edit Clipping Path"), w).clicked() {
+            crate::menus::invoke(app, "object.clippingMask.editMask", json!({}));
+        }
+        if has_contents && widgets::flat_button(ui, tl!("Edit Contents"), w).clicked() {
+            crate::menus::invoke(app, "object.clippingMask.editContents", json!({}));
+        }
+    });
+}
+
 /// The one selected image: its file (or Embedded), colour mode and resolution, and the Links
 /// panel's actions for it.
 fn image_section(app: &mut VectorcraftApp, ui: &mut Ui) {
@@ -149,8 +180,8 @@ fn image_section(app: &mut VectorcraftApp, ui: &mut Ui) {
     let links = crate::panels::links::ID;
     ui.horizontal(|ui| crate::place::link_buttons(app, ui, id, linked, &name, Some(w)));
     ui.horizontal(|ui| {
-        if app.services.pick_open.is_some() && widgets::flat_button(ui, tl!("Relink…"), w).clicked() {
-            crate::panels::links::relink(app, vec![id]);
+        if app.services.pick_open.is_some() && widgets::flat_button(ui, tl!("Replace…"), w).clicked() {
+            crate::panels::links::replace(app, vec![id]);
         }
         if widgets::flat_button(ui, tl!("Links"), w).clicked() {
             app.ui.open_panel = Some(links.into());
@@ -159,7 +190,7 @@ fn image_section(app: &mut VectorcraftApp, ui: &mut Ui) {
 }
 
 /// The one selected Image Trace object: its preset (choosing another traces it again with that
-/// one), view, Expand and Release.
+/// one), view, a button to reveal the tracing controls, Expand and Release.
 fn trace_section(app: &mut VectorcraftApp, ui: &mut Ui, preset: &str, view: vectorcraft_doc::TraceView) {
     section_header(ui, tl!("Image Trace"));
     ui.horizontal(|ui| {
@@ -167,6 +198,9 @@ fn trace_section(app: &mut VectorcraftApp, ui: &mut Ui, preset: &str, view: vect
         crate::panels::image_trace::preset_dropdown(app, ui, preset, ui.available_width());
     });
     ui.horizontal(|ui| crate::panels::image_trace::view_row(app, ui, view, ui.available_width()));
+    if widgets::flat_button(ui, tl!("Image Trace"), ui.available_width()).clicked() {
+        crate::panels::image_trace::open_settings(app);
+    }
     let w = (ui.available_width() - 6.0) / 2.0;
     ui.horizontal(|ui| {
         for (label, id) in [(tl!("Expand"), "imageTrace.expand"), (tl!("Release"), "imageTrace.release")] {
@@ -193,8 +227,10 @@ fn multi_color(app: &mut VectorcraftApp, ctx: &egui::Context) -> bool {
     }
 }
 
-/// Edit Artboards (the Artboard tool): the active artboard's name, position and size, its preset and
-/// orientation (#671) (with Scale Artwork with Artboard on, a new size scales its art, #602), Move
+/// Edit Artboards (the Artboard tool): the active artboard's name, which can be edited to rename
+/// it, and the Artboard Options icon; its position and size, its preset and
+/// orientation (#671) (with Scale Artwork with Artboard on, a new size scales its art, #602; a new
+/// W or H, preset or orientation goes to every selected artboard, in one undo step), its Fill (background color), Move
 /// and Scale Artwork with Artboard, New Artboard and Delete Artboard, and Quick Actions: Rearrange All (#681) and
 /// Exit back to the Selection tool (#530).
 fn artboard_sections(app: &mut VectorcraftApp, ui: &mut Ui) {
@@ -205,8 +241,20 @@ fn artboard_sections(app: &mut VectorcraftApp, ui: &mut Ui) {
     let scale_art = super::artboards::scale_art(app);
     let move_art = super::artboards::move_art(app);
     if let Some(ab) = app.session.active().and_then(|d| d.doc.artboards.get(i)).cloned() {
-        // Its name as it is (names are never translated).
-        ui.label(egui::RichText::new(&ab.name).size(13.0).color(Tokens::get(ui.ctx()).text));
+        // The field shows the artboard's name as it is (names are never translated). Typing a new
+        // name and pressing Enter or clicking elsewhere renames the artboard as the Artboards panel's
+        // rename does; pressing Escape or leaving the field empty keeps the old name. A click on
+        // the icon opens the artboard's Artboard Options, as double-clicking the Artboard tool's
+        // button does.
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 26.0 - ui.spacing().item_spacing.x).max(80.0);
+            if let Some(name) = widgets::text_field(ui, ("ab", "name"), Some(&ab.name), w, 1).filter(|n| !n.is_empty()) {
+                app.run("artboard.setProps", json!({"index": i, "name": name})).ok();
+            }
+            if widgets::icon_button(ui, "dc-artboard-options", tl!("Artboard Options"), false, 26.0).clicked() {
+                app.run("tool.options", json!({"tool": "artboard"})).ok();
+            }
+        });
         let fw = super::field_width(ui);
         egui::Grid::new("ab-grid").num_columns(4).spacing([4.0, 6.0]).min_col_width(0.0).show(ui, |ui| {
             let r = ab.rect;
@@ -221,13 +269,17 @@ fn artboard_sections(app: &mut VectorcraftApp, ui: &mut Ui) {
                         _ => 0.0,
                     };
                     if let Some(v) = widgets::num_field(ui, ("ab", key, row), Some(v - offset), units, fw) {
-                        app.run("artboard.setProps", json!({"index": i, key: v + offset, "scaleArt": scale_art, "moveArt": move_art})).ok();
+                        // A new X or Y moves the active artboard; a new W or H goes to every selected one.
+                        let indices = if matches!(key, "width" | "height") { super::artboards::resized_with(app, i) } else { vec![i] };
+                        let common = json!({"scaleArt": scale_art, "moveArt": move_art});
+                        super::artboards::set_props(app, &indices, common, |j, _| Some(json!({"index": j, key: v + offset}))).ok();
                     }
                 }
                 ui.end_row();
             }
         });
         artboard_size_row(app, ui, i, ab.rect.width(), ab.rect.height());
+        artboard_fill_row(app, ui, i, ab.color);
         ui.add_space(2.0);
         super::artboards::art_options(app, ui);
     }
@@ -237,7 +289,8 @@ fn artboard_sections(app: &mut VectorcraftApp, ui: &mut Ui) {
         if widgets::flat_button(ui, tl!("New Artboard"), w).clicked() && app.run("artboard.new", json!({})).is_ok() {
             super::artboards::select(app, n);
         }
-        if ui.add_enabled_ui(n > 1, |ui| widgets::flat_button(ui, tl!("Delete Artboard"), w)).inner.clicked() {
+        let deletable = n > 1 && !super::artboards::deletable(app, n).is_empty();
+        if ui.add_enabled_ui(deletable, |ui| widgets::flat_button(ui, tl!("Delete Artboard"), w)).inner.clicked() {
             super::artboards::delete_selected(app);
         }
     });
@@ -258,16 +311,73 @@ fn rearrange_button(app: &mut VectorcraftApp, ui: &mut Ui, artboards: usize, w: 
     }
 }
 
+/// A preset `pw` × `ph` turned to an artboard's orientation (`landscape`, or portrait; a square
+/// preset as it is).
+fn turned(landscape: bool, pw: f64, ph: f64) -> (f64, f64) {
+    if (pw > ph) == landscape || pw == ph { (pw, ph) } else { (ph, pw) }
+}
+
 /// Artboard `i`'s size preset (New Document's saved and built-in presets, by category, either way
-/// round; Custom when its `w` × `h` points match none) and its orientation. A preset sizes it in its
-/// current orientation; the other orientation swaps its width and height. Its top-left corner stays
-/// put either way.
-fn artboard_size_row(app: &mut VectorcraftApp, ui: &mut Ui, i: usize, w: f64, h: f64) {
+/// round; Custom when its `w` × `h` points match none) and its orientation, here and in the Control
+/// bar. A preset sizes each selected artboard in its own orientation; an orientation swaps the
+/// width and height of each selected artboard that is not square and not already in it. Each
+/// top-left corner stays put.
+pub(crate) fn artboard_size_row(app: &mut VectorcraftApp, ui: &mut Ui, i: usize, w: f64, h: f64) {
+    let Some(choice) = artboard_size_controls(app, ui, w, h) else { return };
+    let scale_art = super::artboards::scale_art(app);
+    let indices = super::artboards::resized_with(app, i);
+    super::artboards::set_props(app, &indices, json!({"scaleArt": scale_art}), |j, r| {
+        let (width, height) = choice.size_for(r.width(), r.height())?;
+        Some(json!({"index": j, "width": width, "height": height}))
+    })
+    .ok();
+}
+
+/// A shared picker choice, applied separately to each artboard's orientation.
+#[derive(Clone, Copy)]
+pub(crate) enum ArtboardSizeChoice {
+    Preset(f64, f64),
+    Orientation(bool),
+}
+
+impl ArtboardSizeChoice {
+    pub(crate) fn size_for(self, w: f64, h: f64) -> Option<(f64, f64)> {
+        match self {
+            Self::Preset(pw, ph) => Some(turned(w > h, pw, ph)),
+            Self::Orientation(landscape) if (w > h) != landscape && w != h => Some((h, w)),
+            Self::Orientation(_) => None,
+        }
+    }
+}
+
+/// Shared existing presets/orientation UI. Dialogs keep the chosen size in their draft until OK.
+pub(crate) fn artboard_size_controls(app: &VectorcraftApp, ui: &mut Ui, w: f64, h: f64) -> Option<ArtboardSizeChoice> {
+    artboard_size_controls_inner(app, ui, w, h, None).0
+}
+
+/// The dialog's shared preset/orientation picker with optional artwork and selection fits.
+/// The second return value is a chosen Fit: false for all artwork, true for selected artwork.
+pub(crate) fn artboard_size_controls_with_fit(
+    app: &VectorcraftApp,
+    ui: &mut Ui,
+    w: f64,
+    h: f64,
+    enabled: [bool; 2],
+) -> (Option<ArtboardSizeChoice>, Option<bool>) {
+    artboard_size_controls_inner(app, ui, w, h, Some(enabled))
+}
+
+/// Properties and Control keep their ordinary picker; Artboard Options adds two Fit entries.
+fn artboard_size_controls_inner(
+    app: &VectorcraftApp,
+    ui: &mut Ui,
+    w: f64,
+    h: f64,
+    fits: Option<[bool; 2]>,
+) -> (Option<ArtboardSizeChoice>, Option<bool>) {
     let landscape = w > h;
-    // A preset `pw` × `ph` turned to the artboard's orientation.
-    let turned = |pw: f64, ph: f64| if (pw > ph) == landscape || pw == ph { (pw, ph) } else { (ph, pw) };
     let same = |s: &newdoc::DocSettings| {
-        let (pw, ph) = turned(s.width, s.height);
+        let (pw, ph) = turned(landscape, s.width, s.height);
         (pw - w).abs() < 0.01 && (ph - h).abs() < 0.01
     };
     // Recent holds documents made, not presets.
@@ -277,17 +387,28 @@ fn artboard_size_row(app: &mut VectorcraftApp, ui: &mut Ui, i: usize, w: f64, h:
         .filter(|(_, l)| !l.is_empty())
         .collect();
     let current = cats.iter().flat_map(|(_, l)| l).find(|s| same(s)).map_or(tl!("Custom"), |s| crate::dialogs::preset_name(&s.name)).to_string();
-    let mut size = None;
+    // The preset's width and height as listed, or the orientation clicked.
+    let mut preset = None;
+    let mut orientation = None;
+    let mut fit = None;
     ui.horizontal(|ui| {
         dim_label(ui, tl!("Preset:"));
-        size = widgets::combo(ui, "ab-preset", &current, 140.0, false, |ui| {
+        preset = widgets::combo(ui, "ab-preset", &current, 140.0, false, |ui| {
             let mut chosen = None;
+            if let Some(enabled) = fits {
+                for (selection, label) in [(false, tl!("Fit to Artwork Bounds")), (true, tl!("Fit to Selected Art"))] {
+                    if widgets::menu_item_name(ui, label, enabled[usize::from(selection)], false) {
+                        fit = Some(selection);
+                    }
+                }
+                ui.separator();
+            }
             for (cat, list) in &cats {
                 ui.menu_button(tl!(cat), |ui| {
                     widgets::menu_scroll(ui, |ui| {
                         for s in list {
                             if widgets::menu_item_name(ui, crate::dialogs::preset_name(&s.name), true, same(s)) {
-                                chosen = Some(turned(s.width, s.height));
+                                chosen = Some((s.width, s.height));
                             }
                         }
                     });
@@ -297,14 +418,42 @@ fn artboard_size_row(app: &mut VectorcraftApp, ui: &mut Ui, i: usize, w: f64, h:
         });
         ui.spacing_mut().item_spacing.x = 2.0;
         for (is_landscape, tip) in [(false, tl!("Portrait")), (true, tl!("Landscape"))] {
-            if widgets::orientation_button(ui, is_landscape, landscape == is_landscape, tip) && landscape != is_landscape {
-                size = Some((h, w));
+            if widgets::orientation_button(ui, is_landscape, landscape == is_landscape, tip) {
+                orientation = Some(is_landscape);
             }
         }
     });
-    if let Some((width, height)) = size {
-        let scale_art = super::artboards::scale_art(app);
-        app.run("artboard.setProps", json!({"index": i, "width": width, "height": height, "scaleArt": scale_art})).ok();
+    (preset.map(|(w, h)| ArtboardSizeChoice::Preset(w, h)).or_else(|| orientation.map(ArtboardSizeChoice::Orientation)), fit)
+}
+
+/// Artboard `i`'s Fill, its background `color`: the chip shows it (the None paint when the artboard
+/// has none) and a click on it opens the Color Picker for the artboard. The list sets None, White or
+/// Black (in the document's color mode) or opens the Color Picker.
+fn artboard_fill_row(app: &mut VectorcraftApp, ui: &mut Ui, i: usize, color: Option<Color>) {
+    let fills = super::artboards::fill_colors(app);
+    let shown = super::artboards::fill_name(app, color);
+    let mut options = super::artboards::FILLS.to_vec();
+    options.push("Color Picker…");
+    let mut set = None;
+    let mut pick = false;
+    ui.horizontal(|ui| {
+        dim_label(ui, tl!("Fill:"));
+        let paint = color.map_or(Paint::None, Paint::solid);
+        let chip = widgets::chip_button(ui, 22.0, false, |ui, r| {
+            widgets::proxy_chip(ui, r, &paint, false, None);
+        });
+        pick = chip.on_hover_text(tl!("Color Picker…")).clicked();
+        match widgets::dropdown(ui, "ab-fill", shown, &options, 110.0) {
+            Some(k) if k < fills.len() => set = Some(fills[k]),
+            Some(_) => pick = true,
+            None => {}
+        }
+    });
+    if let Some(c) = set {
+        app.run("artboard.setProps", json!({"index": i, "color": c.as_ref().map(super::color_json)})).ok();
+    }
+    if pick {
+        app.run("ui.colorPicker", json!({"artboard": i})).ok();
     }
 }
 
@@ -408,6 +557,7 @@ pub fn transform_section(app: &mut VectorcraftApp, ui: &mut Ui) {
     let b = bx.rect;
     let refi: usize = ui.data(|d| d.get_temp(egui::Id::new("refpt"))).unwrap_or(4);
     let rp = bx.reference_point(refi);
+    let copy = super::transform::alt_enter_copies(app, ui);
     section_header(ui, tl!("Transform"));
     let fw = super::field_width(ui);
     ui.horizontal(|ui| {
@@ -415,24 +565,24 @@ pub fn transform_section(app: &mut VectorcraftApp, ui: &mut Ui) {
             ui.data_mut(|d| d.insert_temp(egui::Id::new("refpt"), i));
         }
         ui.add_space(6.0);
-        let link = app.session.prefs.constrain_proportions;
+        let link = super::transform::proportional(app, ui);
         egui::Grid::new("xf-grid").num_columns(4).spacing([4.0, 6.0]).min_col_width(0.0).show(ui, |ui| {
             dim_label(ui, "X:");
             if let Some(v) = widgets::num_field(ui, "tx", Some(rp.x - origin.x), units, fw) {
-                app.run("object.setBounds", json!({"x": v + origin.x, "reference": refi})).ok();
+                app.run("object.setBounds", json!({"x": v + origin.x, "reference": refi, "copy": copy})).ok();
             }
             dim_label(ui, "W:");
-            if let Some(v) = widgets::num_field(ui, "tw", Some(b.width()), units, fw) {
-                app.run("object.setBounds", json!({"width": v, "reference": refi, "proportional": link})).ok();
+            if let Some(v) = widgets::size_field(ui, "tw", Some(b.width()), units, fw) {
+                app.run("object.setBounds", json!({"width": v, "reference": refi, "proportional": link, "copy": copy})).ok();
             }
             ui.end_row();
             dim_label(ui, "Y:");
             if let Some(v) = widgets::num_field(ui, "ty", Some(rp.y - origin.y), units, fw) {
-                app.run("object.setBounds", json!({"y": v + origin.y, "reference": refi})).ok();
+                app.run("object.setBounds", json!({"y": v + origin.y, "reference": refi, "copy": copy})).ok();
             }
             dim_label(ui, "H:");
-            if let Some(v) = widgets::num_field(ui, "th", Some(b.height()), units, fw) {
-                app.run("object.setBounds", json!({"height": v, "reference": refi, "proportional": link})).ok();
+            if let Some(v) = widgets::size_field(ui, "th", Some(b.height()), units, fw) {
+                app.run("object.setBounds", json!({"height": v, "reference": refi, "proportional": link, "copy": copy})).ok();
             }
             ui.end_row();
         });
@@ -444,11 +594,12 @@ pub fn transform_section(app: &mut VectorcraftApp, ui: &mut Ui) {
         crate::scrub::note_label(ui, icon.rect);
         // The bounding box's angle: a new value turns the selection to it.
         if let Some(a) = widgets::plain_field(ui, "rot", bx.angle, "°", 2, fw) {
-            app.run("object.rotate", json!({"angle": a, "absolute": true})).ok();
+            app.run("object.rotate", json!({"angle": a, "absolute": true, "copy": copy})).ok();
         }
         ui.add_space(10.0);
         // Lucide's flip icons are named for their mirror line: flip-vertical-2 draws a vertical
-        // line (the left-right flip), flip-horizontal-2 a horizontal one (top-bottom).
+        // line (the left-right flip), flip-horizontal-2 a horizontal one (top-bottom). The labels
+        // are the reference app's Properties panel names for the same buttons (#1910).
         if widgets::icon_button(ui, "flip-vertical-2", tl!("Flip Along Horizontal Axis"), false, 24.0).clicked() {
             app.run("object.reflect", json!({"axis": "vertical"})).ok();
         }
@@ -475,7 +626,10 @@ pub fn transform_section(app: &mut VectorcraftApp, ui: &mut Ui) {
         match &**live {
             vectorcraft_doc::LiveShape::Rectangle { .. } => corner_radius_row(app, ui, &n, "radius"),
             vectorcraft_doc::LiveShape::Polygon { .. } => super::transform::polygon_rows(app, ui, &n, live, "props-polygon"),
-            vectorcraft_doc::LiveShape::Ellipse { pie, .. } => super::transform::pie_rows(app, ui, *pie, "props-pie"),
+            vectorcraft_doc::LiveShape::Ellipse { pie, .. } => {
+                widgets::subheader(ui, tl!("Ellipse Properties:"));
+                super::transform::pie_rows(app, ui, *pie, "props-pie");
+            }
             _ => {}
         }
     }
@@ -489,8 +643,8 @@ fn appearance_section(app: &mut VectorcraftApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         widgets::field_label(ui, egui::RichText::new(tl!("Opacity")).size(12.0));
         ui.add_space(8.0);
-        if let Some(o) = widgets::plain_field(ui, "ap-op", n.opacity as f64 * 100.0, "%", 0, fw) {
-            app.run("object.setProps", json!({"opacity": o.clamp(0.0, 100.0)})).ok();
+        if let Some(o) = widgets::range_field(ui, "ap-op", n.opacity as f64 * 100.0, 0.0..=100.0, "%", 0, fw) {
+            app.run("object.setProps", json!({"opacity": o})).ok();
         }
         if widgets::icon_button(ui, "ellipsis", tl!("Transparency"), false, 22.0).clicked() {
             app.ui.open_panel = Some("transparency".into());
@@ -539,6 +693,7 @@ pub fn type_sections(app: &mut VectorcraftApp, ui: &mut Ui) {
     // The font, Font Size, Leading, Kerning and Tracking as in the Character panel.
     let w = ui.available_width();
     super::character::font_pickers(app, ui, &s, ("font", "font-style"), (w - 4.0, w - 4.0));
+    super::character::variable_font(app, ui, &s, w - 4.0);
     super::character::metrics_grid(app, ui, "props-char", &s, w, false);
     section_header(ui, tl!("Paragraph"));
     // As in the Paragraph panel: the seven alignments and Hyphenate (#775); the rest is there.
@@ -566,6 +721,7 @@ mod tests {
         panel_frame(app, ctx, events, show)
     }
 
+    /// One frame of `draw` with `events` → the texts painted, with their rects.
     fn panel_frame(app: &mut VectorcraftApp, ctx: &egui::Context, events: Vec<Event>, draw: fn(&mut VectorcraftApp, &mut Ui)) -> Vec<(String, Rect)> {
         let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(300.0, 700.0))), events, ..Default::default() };
         let mut out = ctx.run_ui(raw, |ui| draw(app, ui));
@@ -582,11 +738,84 @@ mod tests {
             .collect()
     }
 
+    /// Clicks the text `label` where the last frame painted it, over two frames (press, release).
     fn click(app: &mut VectorcraftApp, ctx: &egui::Context, texts: &[(String, Rect)], label: &str) {
         let at = texts.iter().find(|(t, _)| t == label).map(|(_, r)| r.center()).unwrap_or_else(|| panic!("no {label:?} in {texts:?}"));
         let b = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
         frame(app, ctx, vec![Event::PointerMoved(at), b(true)]);
         frame(app, ctx, vec![b(false)]);
+    }
+
+    /// One selected clip group has Edit Clipping Path and Edit Contents at the top of the panel,
+    /// under its Clip Group heading and before every section, and they select its clipping path or
+    /// its clipped art; one that clips nothing has Edit Clipping Path alone. A plain group, or a clip
+    /// group selected with another object, has neither.
+    #[test]
+    fn one_clip_group_has_edit_clipping_path_and_edit_contents_at_the_top() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 400, "height": 300})).unwrap();
+        let art = app.run("shape.rectangle", json!({"x": 100, "y": 80, "width": 200, "height": 140})).unwrap()["id"].clone();
+        let mask = app.run("shape.ellipse", json!({"x": 150, "y": 100, "width": 100, "height": 100})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [art, mask]})).unwrap();
+        let group = app.run("object.clippingMask.make", json!({})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [group]})).unwrap();
+        let ctx = egui::Context::default();
+        let selected = |app: &VectorcraftApp| app.session.active().unwrap().selection.objects.iter().map(|n| json!(n.0)).collect::<Vec<_>>();
+        let labels = |texts: &[(String, Rect)]| texts.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>();
+        let texts = frame(&mut app, &ctx, vec![]);
+        let shown = labels(&texts);
+        let at = |label: &str| shown.iter().position(|t| t == label).unwrap_or_else(|| panic!("{label} in {shown:?}"));
+        assert_eq!(at("Clip Group"), 0, "{shown:?}");
+        assert!(at("Edit Clipping Path") == 1 && at("Edit Contents") == 2, "{shown:?}");
+        click(&mut app, &ctx, &texts, "Edit Contents");
+        assert_eq!(selected(&app), std::slice::from_ref(&art), "Edit Contents selects the clipped art");
+        app.run("select.set", json!({"ids": [group]})).unwrap();
+        let texts = frame(&mut app, &ctx, vec![]);
+        click(&mut app, &ctx, &texts, "Edit Clipping Path");
+        assert_eq!(selected(&app), std::slice::from_ref(&mask), "Edit Clipping Path selects the clipping path");
+        let neither = |app: &mut VectorcraftApp| {
+            let shown = labels(&frame(app, &ctx, vec![]));
+            !shown.iter().any(|t| t == "Edit Clipping Path" || t == "Edit Contents")
+        };
+        // The clip group with another object, whichever is selected first.
+        let other = app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 40, "height": 40})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [group, other]})).unwrap();
+        assert!(neither(&mut app), "a clip group and another object");
+        app.run("select.set", json!({"ids": [other, group]})).unwrap();
+        assert!(neither(&mut app), "another object and a clip group");
+        // A plain group.
+        let b = app.run("shape.rectangle", json!({"x": 60, "y": 10, "width": 40, "height": 40})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [other, b]})).unwrap();
+        let plain = app.run("object.group", json!({})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [plain]})).unwrap();
+        assert!(labels(&frame(&mut app, &ctx, vec![])).iter().any(|t| t == "Ungroup"));
+        assert!(neither(&mut app), "a plain group");
+        // A clip group whose clipped art is deleted: Edit Clipping Path alone.
+        app.run("select.set", json!({"ids": [art]})).unwrap();
+        app.run("edit.clear", json!({})).unwrap();
+        app.run("select.set", json!({"ids": [group]})).unwrap();
+        let texts = frame(&mut app, &ctx, vec![]);
+        let shown = labels(&texts);
+        assert_eq!(shown.iter().position(|t| t == "Edit Clipping Path"), Some(1), "{shown:?}");
+        assert!(!shown.iter().any(|t| t == "Edit Contents"), "nothing to edit: {shown:?}");
+        click(&mut app, &ctx, &texts, "Edit Clipping Path");
+        assert_eq!(selected(&app), std::slice::from_ref(&mask), "Edit Clipping Path selects the clipping path");
+    }
+
+    /// #3451: the Properties panel Transform section shows ellipse pie angles and Invert Pie.
+    #[test]
+    fn transform_section_shows_ellipse_pie_properties() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.run("shape.ellipse", json!({"x": 50, "y": 50, "width": 120, "height": 80})).unwrap();
+        let ctx = egui::Context::default();
+        let labels: Vec<String> = panel_frame(&mut app, &ctx, vec![], transform_section).into_iter().map(|(t, _)| t).collect();
+        for t in ["Ellipse Properties:", "Pie Start Angle:", "0°", "Pie End Angle:", "360°", "Invert Pie"] {
+            assert!(labels.iter().any(|s| s == t), "{t} in {labels:?}");
+        }
+        app.run("object.setLiveShape", json!({"pieStart": 30, "pieEnd": 120})).unwrap();
+        let labels: Vec<String> = panel_frame(&mut app, &ctx, vec![], transform_section).into_iter().map(|(t, _)| t).collect();
+        assert!(labels.iter().any(|s| s == "30°") && labels.iter().any(|s| s == "120°"), "{labels:?}");
     }
 
     /// The Snap Options and Scale Strokes & Effects checkboxes keep a visible box at rest in every
@@ -776,6 +1005,59 @@ mod tests {
         }
     }
 
+    /// Three landscape artboards, with Artboards 1 and 3 selected with the Artboard tool (Artboard
+    /// 1 active): 200 × 100, 200 × 100 and 300 × 150.
+    fn two_selected_artboards() -> VectorcraftApp {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 100, "artboards": 3})).unwrap();
+        app.run("artboard.setProps", json!({"index": 2, "width": 300, "height": 150})).unwrap();
+        app.select_tool("artboard");
+        super::super::artboards::select(&mut app, 0);
+        app.session.set_tool_option("selected", &json!([0, 2]));
+        app
+    }
+
+    /// Each artboard's (x0, y0, width, height).
+    fn boards(app: &VectorcraftApp) -> Vec<(f64, f64, f64, f64)> {
+        app.session.doc().unwrap().doc.artboards.iter().map(|a| (a.rect.x0, a.rect.y0, a.rect.width(), a.rect.height())).collect()
+    }
+
+    /// #1482: with Artboards 1 and 3 selected, a W typed into Properties or the Transform panel
+    /// resizes both in one undo step, and Artboard 2 keeps its size. Properties keeps each top-left
+    /// corner; the Transform panel resizes each about its own center, its default reference point.
+    #[test]
+    fn artboard_width_resizes_every_selected_artboard_in_properties_and_transform() {
+        for (draw, centered) in [(show as fn(&mut VectorcraftApp, &mut Ui), false), (super::super::transform::show, true)] {
+            let mut app = two_selected_artboards();
+            let before = boards(&app);
+            let undo = app.session.doc().unwrap().history.undo.len();
+            let ctx = egui::Context::default();
+            panel_frame(&mut app, &ctx, vec![], draw);
+            let texts = panel_frame(&mut app, &ctx, vec![], draw);
+            let label = texts.iter().find(|(t, _)| t == "W:").unwrap().1;
+            let at = egui::pos2(label.right() + 40.0, label.center().y);
+            let press = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+            let key = |key, modifiers| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+            panel_frame(&mut app, &ctx, vec![Event::PointerMoved(at), press(true)], draw);
+            panel_frame(&mut app, &ctx, vec![press(false)], draw);
+            panel_frame(&mut app, &ctx, vec![key(egui::Key::A, egui::Modifiers::COMMAND)], draw);
+            panel_frame(&mut app, &ctx, vec![Event::Text("250".into())], draw);
+            panel_frame(&mut app, &ctx, vec![key(egui::Key::Enter, egui::Modifiers::NONE)], draw);
+            panel_frame(&mut app, &ctx, vec![], draw);
+            let mut want = before.clone();
+            for (i, shift) in [(0, 25.0), (2, -25.0)] {
+                want[i].2 = 250.0;
+                if centered {
+                    want[i].0 -= shift;
+                }
+            }
+            assert_eq!(boards(&app), want, "centered: {centered}");
+            assert_eq!(app.session.doc().unwrap().history.undo.len(), undo + 1, "one undo step");
+            app.run("edit.undo", json!({})).unwrap();
+            assert_eq!(boards(&app), before);
+        }
+    }
+
     /// #530: Edit Artboards shows the active artboard, with New Artboard, Delete Artboard and Exit.
     /// #775: type's Paragraph section has Hyphenate, and its checkbox turns it on.
     #[test]
@@ -789,6 +1071,22 @@ mod tests {
         click(&mut app, &ctx, &texts, "Hyphenate");
         let hyphenate = |app: &VectorcraftApp| crate::panels::character::text_style(app).unwrap().1.hyphenate;
         assert!(hyphenate(&app));
+    }
+
+    /// Variable fonts get the same Variable Font button in Properties as in the Character panel.
+    #[test]
+    fn properties_variable_font_button_for_variable_type() {
+        use vectorcraft_text::test_fonts::{TWO_AXIS_FAMILY, two_axis_font};
+        vectorcraft_text::FontDb::global().add_font(two_axis_font().unwrap());
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        let plain = app.run("text.create", json!({"x": 20, "y": 50, "text": "Static"})).unwrap()["id"].clone();
+        let id = app.run("text.create", json!({"x": 20, "y": 120, "text": "lIn", "font": TWO_AXIS_FAMILY})).unwrap()["id"].clone();
+        let ctx = egui::Context::default();
+        app.run("select.set", json!({"ids": [plain]})).unwrap();
+        assert!(!frame(&mut app, &ctx, vec![]).iter().any(|(t, _)| t == "Variable Font"));
+        app.run("select.set", json!({"ids": [id]})).unwrap();
+        assert!(frame(&mut app, &ctx, vec![]).iter().any(|(t, _)| t == "Variable Font"));
     }
 
     #[test]
@@ -811,6 +1109,150 @@ mod tests {
         let texts = frame(&mut app, &ctx, vec![]);
         click(&mut app, &ctx, &texts, "Exit");
         assert_eq!(app.session.tool_id(), "selection");
+    }
+
+    /// Typing a name into Edit Artboards' name field and pressing Enter renames the active artboard
+    /// alone, trimmed as the Artboards panel's rename trims it, with one command and one undo step;
+    /// a click elsewhere in the panel renames it too. Pressing Escape or leaving the field empty
+    /// keeps the name and runs no command.
+    #[test]
+    fn edit_artboards_renames_the_active_artboard() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 100, "artboards": 3})).unwrap();
+        app.select_tool("artboard");
+        super::super::artboards::select(&mut app, 1);
+        app.session.doc_mut().unwrap().mark_saved();
+        let before = app.session.doc().unwrap().doc.artboards.clone();
+        let undo = app.session.doc().unwrap().history.undo.len();
+        let ctx = egui::Context::default();
+        let key = |key, modifiers| vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }];
+        // Click the field showing Artboard 2's name, select all of it, type `typed`, then send each
+        // frame's events of `end` → the number of commands run.
+        let rename = |app: &mut VectorcraftApp, typed: Vec<Event>, end: Vec<Vec<Event>>| {
+            frame(app, &ctx, vec![]);
+            let texts = frame(app, &ctx, vec![]);
+            let name = app.session.doc().unwrap().doc.artboards[1].name.clone();
+            click(app, &ctx, &texts, &name);
+            frame(app, &ctx, key(egui::Key::A, egui::Modifiers::COMMAND));
+            let commands = app.run_count;
+            frame(app, &ctx, typed);
+            for events in end {
+                frame(app, &ctx, events);
+            }
+            frame(app, &ctx, vec![]);
+            app.run_count.wrapping_sub(commands)
+        };
+        let enter = || vec![key(egui::Key::Enter, egui::Modifiers::NONE)];
+        let text = |s: &str| vec![Event::Text(s.into())];
+        assert_eq!(rename(&mut app, text("Cover"), vec![key(egui::Key::Escape, egui::Modifiers::NONE)]), 0, "Escape");
+        assert_eq!(rename(&mut app, key(egui::Key::Backspace, egui::Modifiers::NONE), enter()), 0, "an empty field");
+        assert_eq!(app.session.doc().unwrap().doc.artboards, before);
+        assert_eq!(rename(&mut app, text(" Cover "), enter()), 1);
+        let mut renamed = before.clone();
+        renamed[1].name = "Cover".into();
+        let st = app.session.doc().unwrap();
+        assert_eq!(st.doc.artboards, renamed, "Artboard 2 alone is renamed");
+        assert_eq!(st.history.undo.len(), undo + 1, "one undo step");
+        app.run("edit.undo", json!({})).unwrap();
+        let st = app.session.doc().unwrap();
+        assert_eq!(st.doc.artboards, before);
+        assert!(!st.is_dirty());
+        // The click elsewhere is a press and release on the panel's "Artboard" heading, outside
+        // the field.
+        let at = frame(&mut app, &ctx, vec![]).iter().find(|(t, _)| t == "Artboard").map(|(_, r)| r.center()).unwrap();
+        let b = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        assert_eq!(rename(&mut app, text("Back"), vec![vec![Event::PointerMoved(at), b(true)], vec![b(false)]]), 1, "a click elsewhere");
+        renamed[1].name = "Back".into();
+        assert_eq!(app.session.doc().unwrap().doc.artboards, renamed);
+    }
+
+    /// A click on Edit Artboards' Artboard Options icon opens Artboard Options for the active
+    /// artboard, as double-clicking the Artboard tool's button does (`tool.options {tool: "artboard"}`).
+    #[test]
+    fn edit_artboards_opens_the_active_artboards_options() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 100, "artboards": 3})).unwrap();
+        app.select_tool("artboard");
+        super::super::artboards::select(&mut app, 1);
+        app.run("tool.options", json!({"tool": "artboard"})).unwrap();
+        let want = app.ui.dialog.take().unwrap().fields;
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let texts = frame(&mut app, &ctx, vec![]);
+        // The icon is the rightmost clickable widget on the name's line.
+        let name = texts.iter().find(|(t, _)| t == "Artboard 2").map(|(_, r)| *r).unwrap();
+        let icon = ctx.viewport(|vp| {
+            vp.prev_pass
+                .widgets
+                .layers()
+                .flat_map(|(_, w)| w.iter())
+                .filter(|w| w.sense.senses_click() && w.rect.y_range().contains(name.center().y))
+                .map(|w| w.rect)
+                .max_by(|a, b| a.left().total_cmp(&b.left()))
+                .unwrap()
+                .center()
+        });
+        let commands = app.run_count;
+        let press = |pressed| Event::PointerButton { pos: icon, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&mut app, &ctx, vec![Event::PointerMoved(icon), press(true)]);
+        frame(&mut app, &ctx, vec![press(false)]);
+        assert_eq!(app.run_count, commands.wrapping_add(1), "one command");
+        let d = app.ui.dialog.take().expect("Artboard Options");
+        assert_eq!((d.kind.as_str(), d.f64("index", 9.0), d.str("name").as_str()), (crate::dialogs::artboard_options::KIND, 1.0, "Artboard 2"));
+        assert_eq!(d.fields, want, "the fields the tool's double-click shows");
+        assert_eq!(app.session.tool_id(), "artboard");
+    }
+
+    /// Edit Artboards' Fill (Properties › Artboards › Fill): the list sets the active artboard's
+    /// background color to Black and back to None, one command and one undo step each, and shows the
+    /// choice. Color Picker… in the list and a click on the chip open the Color Picker for that
+    /// artboard.
+    #[test]
+    fn edit_artboards_fill_sets_the_background_color() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 100, "artboards": 2})).unwrap();
+        app.select_tool("artboard");
+        super::super::artboards::select(&mut app, 1);
+        let colors = |app: &VectorcraftApp| app.session.doc().unwrap().doc.artboards.iter().map(|a| a.color).collect::<Vec<_>>();
+        let undo = |app: &VectorcraftApp| app.session.doc().unwrap().history.undo.len();
+        let ctx = egui::Context::default();
+        // Open the list showing `shown` and choose `option` → the number of commands run.
+        let choose = |app: &mut VectorcraftApp, shown: &str, option: &str| {
+            frame(app, &ctx, vec![]);
+            let texts = frame(app, &ctx, vec![]);
+            click(app, &ctx, &texts, shown);
+            let texts = frame(app, &ctx, vec![]);
+            let commands = app.run_count;
+            click(app, &ctx, &texts, option);
+            app.run_count.wrapping_sub(commands)
+        };
+        let before = undo(&app);
+        assert_eq!(choose(&mut app, "None", "Black"), 1, "one command");
+        assert_eq!(colors(&app), [None, Some(Color::BLACK)]);
+        assert_eq!(undo(&app), before + 1, "one undo step");
+        assert_eq!(choose(&mut app, "Black", "None"), 1);
+        assert_eq!(colors(&app), [None, None]);
+        choose(&mut app, "None", "Color Picker…");
+        let d = app.ui.dialog.take().expect("the Color Picker");
+        assert_eq!((d.kind.as_str(), d.fields.get("artboard")), ("colorPicker", Some(&json!(1))));
+        // The chip is the clickable widget left of the list on the Fill: row.
+        let texts = frame(&mut app, &ctx, vec![]);
+        let row = texts.iter().find(|(t, _)| t == "Fill:").map(|(_, r)| *r).unwrap();
+        let chip = ctx.viewport(|vp| {
+            vp.prev_pass
+                .widgets
+                .layers()
+                .flat_map(|(_, w)| w.iter())
+                .filter(|w| w.sense.senses_click() && w.rect.y_range().contains(row.center().y) && w.rect.left() > row.right())
+                .map(|w| w.rect)
+                .min_by(|a, b| a.left().total_cmp(&b.left()))
+                .unwrap()
+                .center()
+        });
+        let press = |pressed| Event::PointerButton { pos: chip, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&mut app, &ctx, vec![Event::PointerMoved(chip), press(true)]);
+        frame(&mut app, &ctx, vec![press(false)]);
+        assert_eq!(app.ui.dialog.as_ref().map(|d| d.fields.get("artboard")), Some(Some(&json!(1))), "the chip opens it too");
     }
 
     fn artboard_deletion_app(count: usize) -> VectorcraftApp {
@@ -857,7 +1299,7 @@ mod tests {
 
     fn select_artboard_rows(app: &mut VectorcraftApp, ctx: &egui::Context, indices: &[usize]) {
         for (at, i) in indices.iter().enumerate() {
-            let modifiers = if at == 0 { egui::Modifiers::NONE } else { egui::Modifiers::SHIFT };
+            let modifiers = if at == 0 { egui::Modifiers::NONE } else { egui::Modifiers::COMMAND };
             artboard_deletion_click(app, ctx, super::super::artboards::show, Some(&format!("Artboard {}", i + 1)), modifiers);
         }
         let count = app.session.doc().unwrap().doc.artboards.len();
@@ -1113,7 +1555,7 @@ mod tests {
             artboard_history_new(&mut app, &ctx);
             let created = app.session.doc().unwrap().doc.clone();
             for (at, i) in order.into_iter().enumerate() {
-                let modifiers = if at == 0 { egui::Modifiers::NONE } else { egui::Modifiers::SHIFT };
+                let modifiers = if at == 0 { egui::Modifiers::NONE } else { egui::Modifiers::COMMAND };
                 artboard_deletion_click(&mut app, &ctx, super::super::artboards::show, Some(&format!("Artboard {}", i + 1)), modifiers);
             }
             let options = app.session.tool_options();
@@ -1230,6 +1672,106 @@ mod tests {
         assert!(texts.iter().any(|(t, _)| t == "Letter"), "still Letter, turned: {texts:?}");
         app.run("artboard.setProps", json!({"index": 0, "width": 333})).unwrap();
         assert!(frame(&mut app, &ctx, vec![]).iter().any(|(t, _)| t == "Custom"));
+    }
+
+    /// The center of Edit Artboards' Portrait (`landscape` false) or Landscape button.
+    fn orientation_button(ctx: &egui::Context, texts: &[(String, Rect)], landscape: bool) -> Pos2 {
+        let row = texts.iter().find(|(t, _)| t == "Preset:").map(|(_, r)| *r).unwrap();
+        ctx.viewport(|vp| {
+            let mut r: Vec<Rect> = vp
+                .prev_pass
+                .widgets
+                .layers()
+                .flat_map(|(_, w)| w.iter())
+                .filter(|w| w.sense.senses_click() && w.rect.y_range().contains(row.center().y) && w.rect.left() > row.right())
+                .map(|w| w.rect)
+                .collect();
+            r.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            r[r.len() - if landscape { 1 } else { 2 }].center()
+        })
+    }
+
+    /// #1482: with Artboards 1 and 3 selected, Portrait swaps the width and height of both in one
+    /// undo step, each keeping its top-left corner; Artboard 2 stays landscape. An artboard already
+    /// in that orientation keeps its size.
+    #[test]
+    fn edit_artboards_orientation_turns_every_selected_artboard() {
+        let mut app = two_selected_artboards();
+        let before = boards(&app);
+        let undo = app.session.doc().unwrap().history.undo.len();
+        let ctx = egui::Context::default();
+        let portrait = |app: &mut VectorcraftApp| {
+            frame(app, &ctx, vec![]);
+            let texts = frame(app, &ctx, vec![]);
+            let at = orientation_button(&ctx, &texts, false);
+            let press = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+            frame(app, &ctx, vec![Event::PointerMoved(at), press(true)]);
+            frame(app, &ctx, vec![press(false)]);
+        };
+        portrait(&mut app);
+        let mut want = before.clone();
+        for i in [0, 2] {
+            (want[i].2, want[i].3) = (before[i].3, before[i].2);
+        }
+        assert_eq!(boards(&app), want);
+        assert_eq!(app.session.doc().unwrap().history.undo.len(), undo + 1, "one undo step");
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(boards(&app), before);
+        // Artboard 3 portrait already: Portrait turns Artboard 1 alone.
+        app.run("artboard.setProps", json!({"index": 2, "width": 150, "height": 300})).unwrap();
+        let before = boards(&app);
+        portrait(&mut app);
+        let mut want = before.clone();
+        (want[0].2, want[0].3) = (100.0, 200.0);
+        assert_eq!(boards(&app), want);
+    }
+
+    /// #1482: with Artboards 1 and 3 selected, a preset chosen in Edit Artboards sizes both in one
+    /// undo step, each in its own orientation and keeping its top-left corner: Letter (612 × 792 pt)
+    /// stays portrait for Artboard 1 and turns landscape for Artboard 3. Artboard 2 keeps its size.
+    #[test]
+    fn edit_artboards_preset_sizes_every_selected_artboard() {
+        let mut app = two_selected_artboards();
+        app.run("artboard.setProps", json!({"index": 0, "width": 100, "height": 200})).unwrap();
+        let before = boards(&app);
+        let undo = app.session.doc().unwrap().history.undo.len();
+        let ctx = egui::Context::default();
+        // A frame on a wide screen, with the texts of nested shapes too (the open list and its
+        // submenu), and the center of `label` among them (menu items carry a check-mark column).
+        let run = |app: &mut VectorcraftApp, events: Vec<Event>| {
+            fn walk(s: &egui::Shape, v: &mut Vec<(String, Rect)>) {
+                match s {
+                    egui::Shape::Text(t) => v.push((t.galley.text().to_string(), Rect::from_min_size(t.pos, t.galley.size()))),
+                    egui::Shape::Vec(s) => s.iter().for_each(|s| walk(s, v)),
+                    _ => {}
+                }
+            }
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 700.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| show(app, ui));
+            out.textures_delta.clear();
+            let mut v = vec![];
+            out.shapes.iter().for_each(|c| walk(&c.shape, &mut v));
+            v
+        };
+        let at = |texts: &[(String, Rect)], label: &str| {
+            texts.iter().find(|(t, _)| t.trim() == label).map(|(_, r)| r.center()).unwrap_or_else(|| panic!("no {label:?} in {texts:?}"))
+        };
+        let press = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        run(&mut app, vec![]);
+        let custom = at(&run(&mut app, vec![]), "Custom");
+        run(&mut app, vec![Event::PointerMoved(custom), press(custom, true)]);
+        run(&mut app, vec![press(custom, false)]);
+        // Hovering Print opens its submenu.
+        let print = at(&run(&mut app, vec![]), "Print");
+        run(&mut app, vec![Event::PointerMoved(print)]);
+        let letter = at(&run(&mut app, vec![]), "Letter");
+        run(&mut app, vec![Event::PointerMoved(letter), press(letter, true)]);
+        run(&mut app, vec![press(letter, false)]);
+        let mut want = before.clone();
+        (want[0].2, want[0].3) = (612.0, 792.0);
+        (want[2].2, want[2].3) = (792.0, 612.0);
+        assert_eq!(boards(&app), want);
+        assert_eq!(app.session.doc().unwrap().history.undo.len(), undo + 1, "one undo step");
     }
 
     /// #602: Edit Artboards shows Move and Scale Artwork with Artboard; with Scale on, a new size

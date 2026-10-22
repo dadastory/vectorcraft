@@ -51,6 +51,24 @@ pub fn play(app: &mut VectorcraftApp, set: usize, idx: usize) -> Result<Value, S
     app.run("command.batch", json!({"label": a.name, "commands": commands}))
 }
 
+/// The panel's (≡) menu.
+pub fn menu(app: &mut VectorcraftApp, ui: &mut egui::Ui) {
+    let selected: Option<(usize, usize)> = pstate(ui.ctx(), "actions-selected");
+    let has = selected.and_then(|(s, a)| app.ui.action_sets.get(s).and_then(|set| set.actions.get(a))).is_some();
+    if widgets::menu_item(ui, tl!("Batch…"), has, false)
+        && let Some((s, a)) = selected
+        && let Err(e) = crate::dialogs::action_batch::open(app, s, a)
+    {
+        app.status(e);
+    }
+    if widgets::menu_item(ui, tl!("Play Current Selection"), has, false)
+        && let Some((s, a)) = selected
+        && let Err(e) = play(app, s, a)
+    {
+        app.status(e);
+    }
+}
+
 pub fn show(app: &mut VectorcraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     // The selected action as (set, action). Read as the type it is stored as: egui keeps a
@@ -100,6 +118,8 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut egui::Ui) {
         if widgets::icon_button(ui, "square", tl!("Stop Playing/Recording"), false, 24.0).clicked()
             && let Some((set, name, start)) = app.ui.recording.take()
         {
+            // A canceled undo group numbers the steps down when it drops entries made before them.
+            let start = app.session.journal.held().unwrap_or(start);
             let steps = app.session.journal_for_action(start);
             app.session.journal.hold(None);
             if let Some(s) = app.ui.action_sets.get_mut(set) {
@@ -193,6 +213,37 @@ mod tests {
         assert_eq!(names(&app), before[1..], "nothing selected after a delete: nothing more goes");
     }
 
+    /// A recording keeps its steps when a canceled undo group drops journal entries made before the
+    /// recording began.
+    #[test]
+    fn a_recording_keeps_its_steps_when_a_canceled_undo_group_drops_earlier_entries() {
+        use super::super::tests_appearance::{click, frame_events};
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        let rect = |x: i32| json!({"x": x, "y": 10, "width": 20, "height": 20});
+        for (id, p) in [
+            ("file.new", json!({"width": 200, "height": 100})),
+            ("file.new", json!({"width": 200, "height": 100})),
+            ("document.activate", json!({"index": 0})),
+            ("edit.undoGroup.begin", json!({})),
+            ("shape.rectangle", rect(10)),
+        ] {
+            app.run(id, p).unwrap();
+        }
+        let ctx = egui::Context::default();
+        frame_events(&ctx, &mut app, vec![], show);
+        // The bottom bar's 24-point buttons, left to right: stop, record, play, delete.
+        let mut bar = crate::toolbar::tests::widget_rects(&ctx, egui::vec2(24.0, 24.0));
+        bar.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        let [stop, record, _, _] = bar[..] else { panic!("the bottom bar: {bar:?}") };
+        click(&ctx, &mut app, record.center(), show);
+        for (id, p) in [("document.activate", json!({"index": 1})), ("shape.rectangle", rect(50)), ("edit.undoGroup.end", json!({"cancel": true}))] {
+            app.run(id, p).unwrap();
+        }
+        click(&ctx, &mut app, stop.center(), show);
+        let steps = app.ui.action_sets[0].actions.last().map(|a| a.steps.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>());
+        assert_eq!(steps, Some(vec!["document.activate".to_string(), "shape.rectangle".into(), "edit.undoGroup.end".into()]));
+    }
+
     /// Actions recorded with Align to Artboard and Paste in Place, and the default Center on
     /// Artboard, play on the artboard active when they play, not on the one active when they were
     /// recorded.
@@ -233,5 +284,44 @@ mod tests {
         let center = app.ui.action_sets[0].actions.iter().position(|a| a.name == "Center on Artboard").unwrap();
         play(&mut app, 0, center).unwrap();
         assert_eq!(bounds(&app, &[rect]).center(), boards[1].center(), "centered on artboard 1, the active one");
+    }
+
+    /// Actions that record Distribute Objects and Distribute Spacing with Align to Artboard play on
+    /// the artboard active when they play, not on the one active when they were recorded.
+    #[test]
+    fn distribute_actions_play_on_the_artboard_active_when_they_play() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 100, "artboards": 3})).unwrap();
+        let boards: Vec<_> = app.session.active().unwrap().doc.artboards.iter().map(|a| a.rect).collect();
+        // The rectangles are 20, 40 and 20 pt wide, and they are on artboard 1.
+        let ids: Vec<vectorcraft_doc::NodeId> = [(10.0, 20.0), (50.0, 40.0), (120.0, 20.0)]
+            .into_iter()
+            .map(|(x, w)| {
+                let r = app.run("shape.rectangle", json!({"x": boards[1].x0 + x, "y": boards[1].y0 + 15.0, "width": w, "height": 20})).unwrap();
+                vectorcraft_doc::NodeId(r["id"].as_u64().unwrap())
+            })
+            .collect();
+        app.run("select.set", json!({"ids": ids.iter().map(|id| id.0).collect::<Vec<_>>()})).unwrap();
+        let lefts =
+            |app: &VectorcraftApp| ids.iter().map(|id| app.session.active().unwrap().doc.bounds_of(&[*id], false).unwrap().x0).collect::<Vec<_>>();
+        // Each step is recorded as the panel records an action, while artboard 0 is active.
+        let record = |app: &mut VectorcraftApp, name: &str, id: &str, params: Value| {
+            let start = app.session.journal.len();
+            app.run(id, params).unwrap();
+            let steps = app.session.journal_for_action(start);
+            app.ui.action_sets[0].actions.push(Action { name: name.into(), steps });
+            app.ui.action_sets[0].actions.len() - 1
+        };
+        let (x0, x1) = (boards[0].x0, boards[0].x1);
+        let distribute = record(&mut app, "Distribute Left", "object.distribute", json!({"horizontal": "left", "to": "artboard"}));
+        assert_eq!(lefts(&app), [x0, x0 + 90.0, x1 - 20.0], "distributed across artboard 0 while recording");
+        let spacing = record(&mut app, "Distribute Spacing", "object.distributeSpacing", json!({"axis": "horizontal", "to": "artboard"}));
+        assert_eq!(lefts(&app), [x0, x0 + 80.0, x1 - 20.0], "spaced across artboard 0 while recording");
+        app.view_mut().unwrap().artboard = 2;
+        let (x0, x1) = (boards[2].x0, boards[2].x1);
+        play(&mut app, 0, distribute).unwrap();
+        assert_eq!(lefts(&app), [x0, x0 + 90.0, x1 - 20.0], "distributed across artboard 2, active when the action plays");
+        play(&mut app, 0, spacing).unwrap();
+        assert_eq!(lefts(&app), [x0, x0 + 80.0, x1 - 20.0], "spaced across artboard 2, active when the action plays");
     }
 }

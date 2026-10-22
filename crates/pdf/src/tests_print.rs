@@ -23,7 +23,15 @@ fn doc(w: f64, h: f64, shapes_: &[(Rect, Paint)]) -> Document {
 }
 
 fn artboard(id: u32, x: f64) -> Artboard {
-    Artboard { id, name: format!("Artboard {id}"), rect: Rect::new(x, 0.0, x + 100.0, 100.0), show_center_mark: false, show_cross_hairs: false }
+    Artboard {
+        id,
+        name: format!("Artboard {id}"),
+        rect: Rect::new(x, 0.0, x + 100.0, 100.0),
+        locked: false,
+        show_center_mark: false,
+        show_cross_hairs: false,
+        color: None,
+    }
 }
 
 fn rgb(r: f32, g: f32, b: f32) -> Paint {
@@ -92,6 +100,75 @@ fn defaults_and_json() {
         assert!(matches!(settings(bad.clone()).check(), Err(PdfError::BadSetting(_))), "{bad}");
     }
     assert_eq!(Media::A4.size().map(|(w, h)| (w.round(), h.round())), Some((595.0, 842.0)));
+}
+
+#[test]
+fn japanese_paper_sizes() {
+    // The Japanese papers: JIS B4, B5 and B6 are the sizes Japanese printing uses (JIS X 6310),
+    // a little larger than ISO's; the others are はがき, 往復はがき, 封筒 and 四六判.
+    let near = |m: Media, w: f64, h: f64| {
+        let (mw, mh) = m.size().unwrap();
+        assert!((mw - w).abs() < 0.01 && (mh - h).abs() < 0.01, "{m:?} is {mw} × {mh}, not {w} × {h}");
+    };
+    near(Media::B4Jis, 728.50, 1031.81);
+    near(Media::B5Jis, 515.91, 728.50);
+    near(Media::B6Jis, 362.83, 515.91);
+    near(Media::A6, 297.64, 419.53);
+    near(Media::JapanesePostcard, 283.46, 419.53);
+    near(Media::JapaneseDoublePostcard, 419.53, 566.93);
+    near(Media::JapaneseEnvelope3, 340.16, 666.14);
+    near(Media::JapaneseEnvelope4, 255.12, 637.80);
+    near(Media::Kaku2, 680.31, 941.10);
+    near(Media::Kaku3, 612.28, 785.20);
+    near(Media::YonrokuBan, 360.0, 532.91);
+    // The ISO B sizes keep the dimensions settings and presets saved before the Japanese papers
+    // existed: they are not the JIS sizes.
+    near(Media::B4, 708.66, 1000.63);
+    near(Media::B5, 498.90, 708.66);
+
+    // A paper is named by its JSON id or its dialog label, any case and spacing.
+    for (name, want) in [
+        ("b4 (jis)", Media::B4Jis),
+        ("B4 (JIS)", Media::B4Jis),
+        ("b4jis", Media::B4Jis),
+        ("b5", Media::B5),
+        ("B5 (ISO)", Media::B5),
+        ("b5 (jis)", Media::B5Jis),
+        ("japanese postcard", Media::JapanesePostcard),
+        ("Japanese Postcard", Media::JapanesePostcard),
+        ("Japanese Envelope #3", Media::JapaneseEnvelope3),
+        ("kaku #2", Media::Kaku2),
+        ("yonroku-ban", Media::YonrokuBan),
+    ] {
+        assert_eq!(Media::from_name(name), Some(want), "{name}");
+    }
+    assert_eq!(Media::from_name("b7"), None);
+    assert_eq!(Media::from_name("  "), None);
+    for m in Media::ALL {
+        assert_eq!(Media::from_name(m.id()), Some(*m), "id {:?}", m.id());
+        assert_eq!(Media::from_name(m.label()), Some(*m), "label {:?}", m.label());
+        assert_eq!(serde_json::to_value(m).unwrap(), json!(m.id()));
+        assert_eq!(serde_json::from_value::<Media>(json!(m.id())).unwrap(), *m);
+    }
+    assert!(serde_json::from_value::<Media>(json!("b7")).is_err(), "an unknown paper is refused");
+
+    // Every paper prints as a page of its own size, the added ones included.
+    let d = doc(50.0, 50.0, &[(Rect::new(0.0, 0.0, 50.0, 50.0), rgb(0.0, 0.0, 0.0))]);
+    for (media, w, h) in [
+        ("japanese postcard", 283.46, 419.53),
+        ("japanese double postcard", 419.53, 566.93),
+        ("B5 (JIS)", 515.91, 728.50),
+        ("kaku #2", 680.31, 941.10),
+        ("yonroku-ban", 360.0, 532.91),
+        // The ISO B sizes keep their page size.
+        ("b5", 498.90, 708.66),
+    ] {
+        let r = job(&d, json!({"media": media, "autoRotate": false}));
+        assert_eq!(r.pages, 1, "{media}");
+        let p = pages(&r.bytes);
+        assert_eq!(p.len(), 1, "{media}");
+        assert!((p[0].0.0 - w).abs() < 0.01 && (p[0].0.1 - h).abs() < 0.01, "{media}: {:?}, not {w} × {h}", p[0].0);
+    }
 }
 
 #[test]
@@ -395,4 +472,25 @@ fn golden_page_one() {
         let c = img.over_white(px, py);
         assert!(c.iter().zip(want).all(|(a, b)| a.abs_diff(b) < 40), "({px}, {py}): {c:?} vs {want:?}");
     }
+}
+
+/// Separations go through the document's colour spaces: the CMYK profile assigned to it, not the
+/// working one (a document opened again in a new session keeps its profile, while the working
+/// spaces go back to the defaults).
+#[test]
+fn separations_use_the_cmyk_profile_assigned_to_the_document() {
+    let mut d = doc(100.0, 100.0, &[(Rect::new(0.0, 0.0, 50.0, 50.0), rgb(0.5, 0.5, 0.5))]);
+    d.color_mode = vectorcraft_doc::ColorMode::Cmyk;
+    // The cyan of the grey square, in percent.
+    let cyan = |d: &Document| -> f32 {
+        let p = pages(&job(d, json!({"output": {"mode": "separations"}})).bytes);
+        match p[0].1.iter().find(|(b, _)| (b.width() - 50.0).abs() < 1.0).and_then(|(_, p)| p.color()) {
+            Some(Color::Gray { k }) => (k * 100.0).round(),
+            c => panic!("{c:?}"),
+        }
+    };
+    let working = cyan(&d);
+    assert!(working > 0.0, "the working CMYK profile separates grey into four inks: cyan {working}");
+    d.color_profiles.cmyk = Some(vectorcraft_color::cms::DEVICE_CMYK.into());
+    assert_eq!(cyan(&d), 0.0, "Device CMYK puts a neutral grey on the black plate only");
 }

@@ -9,7 +9,7 @@ use vectorcraft_engine::Prefs;
 use vectorcraft_engine::cmd::prefscmds::{GPU_PREFERENCES, PREF_CATEGORIES, PREF_GROUPS, PREF_SPECS, PrefKind};
 
 use crate::state::Dialog;
-use crate::theme::{self, Brightness, Tokens};
+use crate::theme::{self, Accent, Brightness, Scheme, Tokens};
 use crate::{VectorcraftApp, widgets};
 
 /// UI-only fields shown in the dialog (backed by `UiState`, not engine prefs).
@@ -39,7 +39,11 @@ pub fn open(app: &mut VectorcraftApp, category: Option<&str>) {
 pub fn confirm(app: &mut VectorcraftApp) -> Result<Value, String> {
     let Some(d) = app.ui.dialog.clone() else { return Err("no dialog open".into()) };
     let values: Map<String, Value> = d.fields.iter().filter(|(k, _)| !k.starts_with("__")).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let touch_ws = values.get("touchWorkspace").and_then(Value::as_bool);
     app.run("prefs.set", json!({ "values": values }))?;
+    if touch_ws.is_some() {
+        crate::workspaces::sync_touch_workspace(app, app.touch_screen);
+    }
     app.ui.view.smart_guides = d.fields.get("__smartGuides").and_then(Value::as_bool).unwrap_or(app.ui.view.smart_guides);
     app.ui.view.snap_to_grid = d.fields.get("__snapToGrid").and_then(Value::as_bool).unwrap_or(app.ui.view.snap_to_grid);
     app.ui.task_bar = d.fields.get("__taskBar").and_then(Value::as_bool).unwrap_or(app.ui.task_bar);
@@ -81,6 +85,8 @@ pub fn restore(app: &mut VectorcraftApp) {
 #[derive(Clone, Copy, PartialEq)]
 struct Applied {
     brightness: Brightness,
+    accent: Accent,
+    scheme: Scheme,
     /// User Interface › Canvas Color, unless it matches the interface brightness.
     canvas: Option<egui::Color32>,
     threads: i32,
@@ -111,6 +117,8 @@ pub fn apply_runtime(app: &mut VectorcraftApp, ctx: &egui::Context) {
     }
     let want = Applied {
         brightness: app.ui.brightness,
+        accent: Accent::parse(&p.ui_accent).unwrap_or_default(),
+        scheme: Scheme::parse(&p.ui_color_scheme).unwrap_or_default(),
         canvas: canvas_color(&p.canvas_color),
         threads: p.render_threads,
         tool_tips: p.show_tool_tips,
@@ -120,7 +128,7 @@ pub fn apply_runtime(app: &mut VectorcraftApp, ctx: &egui::Context) {
     let id = egui::Id::new("dc-applied-prefs");
     let prev: Option<Applied> = ctx.data(|d| d.get_temp::<Option<Applied>>(id)).flatten();
     if prev != Some(want) {
-        theme::apply(ctx, want.brightness);
+        theme::apply_with(ctx, want.brightness, want.accent, want.scheme);
         // General › Show Tool Tips: off, no button or field shows its tool tip (they never come
         // due), whichever widget asks for one.
         let delay = if want.tool_tips { egui::style::Interaction::default().tooltip_delay } else { f32::INFINITY };
@@ -144,6 +152,11 @@ pub fn apply_runtime(app: &mut VectorcraftApp, ctx: &egui::Context) {
     let z = app.session.prefs.ui_scaling.clamp(0.75, 2.0) as f32;
     if (ctx.zoom_factor() - z).abs() > 1e-3 {
         ctx.set_zoom_factor(z);
+    }
+    let touch = ctx.input(|i| i.has_touch_screen());
+    if touch != app.touch_screen {
+        app.touch_screen = touch;
+        crate::workspaces::sync_touch_workspace(app, touch);
     }
 }
 
@@ -309,18 +322,24 @@ fn category_fields(ui: &mut egui::Ui, d: &mut Dialog, cat: &str) {
             }
             // Linux only: the other platforms have a single display server.
             PrefKind::Choice(_) if sp.key == "linuxDisplayServer" && !cfg!(target_os = "linux") => {}
+            // The Classic colour scheme has its own accent: dimmed while it is chosen.
+            PrefKind::Choice(opts) if sp.key == "uiAccent" => {
+                let modern = Scheme::parse(&d.str("uiColorScheme")).unwrap_or_default() == Scheme::Modern;
+                ui.add_enabled_ui(modern, |ui| choice_row(ui, d, sp.key, sp.label, opts, &v));
+            }
             PrefKind::Choice(opts) => {
-                labeled(ui, sp.label, |ui| {
-                    let cur = v.as_str().unwrap_or("");
-                    let cur_label = opts.iter().find(|o| o.0 == cur).map(|o| o.1).unwrap_or(cur);
-                    let labels: Vec<&str> = opts.iter().map(|o| o.1).collect();
-                    if let Some(i) = widgets::dropdown(ui, sp.key, cur_label, &labels, 260.0) {
-                        d.fields.insert(sp.key.into(), json!(opts[i].0));
-                    }
-                });
+                choice_row(ui, d, sp.key, sp.label, opts, &v);
                 if sp.key == "gpuPreference" || sp.key == "linuxDisplayServer" {
                     // The window's graphics device and display server are chosen once, when the app starts.
                     ui.label(egui::RichText::new(tl!("Applies the next time VectorCraft starts.")).color(t.text_dim).size(11.0));
+                }
+                if sp.key == "linuxDisplayServer" {
+                    // Many Wayland desktops give a drawing tablet's pen to the window only through XWayland (#2028).
+                    ui.label(
+                        egui::RichText::new(tl!("If a drawing tablet's pen doesn't draw, choose an X11 (XWayland) option."))
+                            .color(t.text_dim)
+                            .size(11.0),
+                    );
                 }
             }
             PrefKind::Color => {
@@ -338,8 +357,9 @@ fn category_fields(ui: &mut egui::Ui, d: &mut Dialog, cat: &str) {
                 // `auto` plus every registered language, by its own name.
                 labeled(ui, sp.label, |ui| {
                     let cur = v.as_str().unwrap_or("auto");
-                    let codes: Vec<&str> = std::iter::once("auto").chain(crate::i18n::Lang::all().map(|l| l.code())).collect();
-                    let labels: Vec<&str> = std::iter::once(tl!("Auto")).chain(crate::i18n::Lang::all().map(|l| l.name())).collect();
+                    let codes: Vec<&str> = std::iter::once("auto").chain(crate::i18n::Lang::for_picker().into_iter().map(|l| l.code())).collect();
+                    let labels: Vec<&str> =
+                        std::iter::once(tl!("Auto")).chain(crate::i18n::Lang::for_picker().into_iter().map(|l| l.name())).collect();
                     let cur_label = codes.iter().position(|c| c.eq_ignore_ascii_case(cur)).and_then(|i| labels.get(i).copied()).unwrap_or(cur);
                     if let Some(i) = widgets::dropdown(ui, sp.key, cur_label, &labels, 260.0)
                         && let Some(code) = codes.get(i)
@@ -363,6 +383,19 @@ fn category_fields(ui: &mut egui::Ui, d: &mut Dialog, cat: &str) {
 /// Is one of the dialog's Units (General, Stroke, Type, East Asian Type) Picas?
 fn picas_in_use(d: &Dialog) -> bool {
     ["unitsGeneral", "unitsStroke", "unitsType", "unitsAsianType"].iter().any(|k| d.str(k) == vectorcraft_doc::Unit::Picas.key())
+}
+
+fn choice_row(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str, opts: &[(&str, &str)], v: &Value) {
+    labeled(ui, label, |ui| {
+        let cur = v.as_str().unwrap_or("");
+        let cur_label = opts.iter().find(|o| o.0 == cur).map(|o| o.1).unwrap_or(cur);
+        let labels: Vec<&str> = opts.iter().map(|o| o.1).collect();
+        if let Some(i) = widgets::dropdown(ui, key, cur_label, &labels, 260.0)
+            && let Some(o) = opts.get(i)
+        {
+            d.fields.insert(key.into(), json!(o.0));
+        }
+    });
 }
 
 fn bool_row(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str) {
@@ -597,6 +630,40 @@ mod tests {
         assert!(a.session.prefs.system_title_bar);
         let saved: Value = serde_json::from_slice(&serde_json::to_vec(&a.ui).unwrap()).unwrap();
         assert_eq!(saved["engine_prefs"]["systemTitleBar"], json!(true));
+    }
+
+    /// Performance › Linux Display Server (#2028): on Linux it shows the drawing-tablet note, and
+    /// X11 (XWayland) When a Pen Is Attached is applied by OK and saved under the key the desktop
+    /// app reads before the window opens.
+    #[test]
+    fn linux_display_server_offers_the_pen_choice() {
+        fn texts(s: &egui::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let mut a = app();
+        open(&mut a, Some("Performance"));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // The window sizes itself on the first frame and draws on the second.
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut a, ui.ctx()));
+        out.textures_delta.clear();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut a, ui.ctx()));
+        out.textures_delta.clear();
+        let mut shown = vec![];
+        out.shapes.iter().for_each(|c| texts(&c.shape, &mut shown));
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(shown.iter().any(|t| t.starts_with("Linux Display Server")), linux, "{shown:?}");
+        let note = "If a drawing tablet's pen doesn't draw, choose an X11 (XWayland) option.";
+        assert_eq!(shown.iter().any(|t| t == note), linux, "{shown:?}");
+        a.ui.dialog.as_mut().unwrap().fields.insert("linuxDisplayServer".into(), json!("x11WithPen"));
+        confirm(&mut a).unwrap();
+        assert_eq!(a.session.prefs.linux_display_server, "x11WithPen");
+        let saved: Value = serde_json::from_slice(&serde_json::to_vec(&a.ui).unwrap()).unwrap();
+        assert_eq!(saved["engine_prefs"]["linuxDisplayServer"], json!("x11WithPen"));
     }
 
     /// #1866: the category shown is highlighted in the list while the pointer is elsewhere.

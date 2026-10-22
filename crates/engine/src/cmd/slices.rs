@@ -280,7 +280,7 @@ pub(crate) fn options_json(o: &SliceOptions) -> Value {
 
 fn make(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = match ids_param(p, "ids") {
-        Some(ids) => ids,
+        Some(ids) => super::edit::outermost(&s.doc()?.doc, ids),
         None => super::edit::selected_roots(s)?,
     };
     let d = &s.doc()?.doc;
@@ -409,7 +409,7 @@ fn splits(lo: f64, hi: f64, count: Option<u64>, size: Option<f64>) -> std::resul
         (None, Some(_)) => return Err("a slice size must be a positive number of points".into()),
         (None, None) => 1,
     };
-    if n == 0 || n as usize > MAX_PIECES {
+    if n == 0 || index(n) > MAX_PIECES {
         return Err(format!("divide into 1 to {MAX_PIECES} slices"));
     }
     let step = match (count, size) {

@@ -98,3 +98,59 @@ sync_github_name = false
 real_name = "Tomasz Lewandowski"
 display_name = "Tomasz Lewandowski"
 sync_github_name = false
+
+[people.osamaamin2011]
+real_name = "Osama Amin"
+display_name = "Osama Amin"
+sync_github_name = false
+
+[people.giang17]
+real_name = "Giang Nguyen"
+
+[people.Silvertree2010]
+display_name = "Netter"
+sync_github_name = false
+
+[people.limackk]
+real_name = "Kamil Kwiatkowski"
+display_name = "Kamil Kwiatkowski"
+sync_github_name = false
+
+[people.marcoarnulfo]
+real_name = "Marco Arnulfo"
+display_name = "Marco Arnulfo"
+sync_github_name = false
+
+[people.theromis]
+sync_github_name = true
+
+[people.dennismutuku2005]
+sync_github_name = true
+
+[people.krinry]
+display_name = "krinry"
+sync_github_name = true
+
+[people.makesomethingshit]
+sync_github_name = true
+
+[people.MiQ71]
+real_name = "Mirko Kerezovic"
+sync_github_name = false
+
+[people.KaboomFox]
+sync_github_name = true
+
+[people.odysseexp]
+real_name = "Harley Paiva"
+sync_github_name = true
+
+[people.addibble]
+sync_github_name = true
+
+[people.mockydevs]
+real_name = "Don Omondi"
+display_name = "Don Omondi"
+
+[people.alpha-rock]
+display_name = "Aditya Sisodiya"

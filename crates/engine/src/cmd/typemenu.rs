@@ -160,6 +160,13 @@ fn edit_runs<S: Default>(s: &mut Session, label: &str, ids: &[NodeId], f: impl F
 
 // ---------- Change Case ----------
 
+/// Does `c` take a capital at the start of a word or sentence? Georgian has no word capitals:
+/// Mtavruli is a separate all-caps style, so title and sentence case leave Mkhedruli (and turn
+/// Mtavruli back into) lower case. Upper case still gives Mtavruli, as Unicode defines it.
+fn capitalizes(c: char) -> bool {
+    !matches!(c, '\u{10D0}'..='\u{10FF}' | '\u{1C90}'..='\u{1CBF}')
+}
+
 #[derive(Default)]
 struct CaseState {
     /// Previous character (across runs).
@@ -187,7 +194,7 @@ fn change_case(s: &mut Session, p: &Value) -> Result<Value> {
                 "upper" | "uppercase" => out.extend(c.to_uppercase()),
                 "lower" | "lowercase" => out.extend(c.to_lowercase()),
                 "title" => {
-                    if st.prev.is_none_or(|p| p.is_whitespace() || matches!(p, '-' | '(' | '"' | '“' | '/')) {
+                    if capitalizes(c) && st.prev.is_none_or(|p| p.is_whitespace() || matches!(p, '-' | '(' | '"' | '“' | '/')) {
                         out.extend(c.to_uppercase())
                     } else {
                         out.extend(c.to_lowercase())
@@ -195,7 +202,11 @@ fn change_case(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 _ => {
                     if c.is_alphabetic() && st.sentence {
-                        out.extend(c.to_uppercase());
+                        if capitalizes(c) {
+                            out.extend(c.to_uppercase());
+                        } else {
+                            out.extend(c.to_lowercase());
+                        }
                         st.sentence = false;
                     } else {
                         out.extend(c.to_lowercase());
@@ -635,9 +646,10 @@ pub(crate) fn find_all(hay: &str, needle: &str, match_case: bool, whole_word: bo
 
 fn all_texts(d: &Document) -> Vec<NodeId> {
     let mut v = vec![];
+    let locks = d.locked_artboards();
     for l in d.layers.iter().filter(|l| l.visible && !l.locked) {
         l.walk(&mut |n| {
-            if matches!(n.kind, NodeKind::Text(_)) && n.visible && !n.locked {
+            if matches!(n.kind, NodeKind::Text(_)) && n.visible && !n.locked && !locks.holds_id(n.id) {
                 v.push(n.id);
             }
         });
@@ -665,16 +677,39 @@ fn find_replace(s: &mut Session, p: &Value) -> Result<Value> {
     if total == 0 {
         return Ok(json!({ "count": 0 }));
     }
-    edit_runs::<()>(s, "Replace", &ids, |text, _| {
-        let mut out = String::with_capacity(text.len());
-        let mut last = 0;
-        for (a, b) in find_all(text, &find, mc, ww) {
-            out.push_str(&text[last..a]);
-            out.push_str(&rep);
-            last = b;
+    super::overprint::edit_counted(s, "Replace", |d| {
+        let mut changed = 0;
+        for id in &ids {
+            let Some(NodeKind::Text(t)) = d.node_mut(*id).map(|n| &mut n.kind) else { continue };
+            // Matches as (run, start, end) with offsets inside the run. Inline graphics are art, not
+            // characters to rewrite.
+            let mut hits = vec![];
+            let mut base = 0;
+            for (ri, r) in t.runs.iter().enumerate() {
+                if r.inline.is_none() {
+                    for (a, b) in find_all(&r.text, &find, mc, ww) {
+                        if r.text.get(a..b) != Some(rep.as_str()) {
+                            hits.push((ri, base + a, base + b, a, b));
+                        }
+                    }
+                }
+                base += r.text.len();
+            }
+            if hits.is_empty() {
+                continue;
+            }
+            // Last match first, so the offsets of earlier ones stay valid. The paragraph styles follow
+            // each edit, as `text.editRange` does.
+            for (ri, ta, tb, a, b) in hits.into_iter().rev() {
+                t.splice_paras(ta, tb, &rep);
+                if let Some(r) = t.runs.get_mut(ri) {
+                    r.text.replace_range(a..b, &rep);
+                }
+            }
+            changed += 1;
+            refresh_bounds(t);
         }
-        out.push_str(&text[last..]);
-        out
+        Ok(changed)
     })?;
     Ok(json!({ "count": total }))
 }

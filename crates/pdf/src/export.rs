@@ -1,15 +1,16 @@
 //! Document → PDF (krilla). Mirrors the tree walk of `vectorcraft-render`.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use craft_pdf::write::backend as krilla;
+use craft_pdf::write::{self, Metadata};
 use krilla::color::separation::{Color as SepColor, SeparationColorant, SeparationSpace};
 use krilla::color::{cmyk, luma, rgb};
-use krilla::configure::{Archival, ConfigurationBuilder, PdfVersion};
+use krilla::configure::{Archival, PdfVersion};
 use krilla::geom::{Path, PathBuilder, Size, Transform};
 use krilla::image::Image;
-use krilla::metadata::Metadata;
 use krilla::num::NormalizedF32;
 use krilla::page::PageSettings;
 use krilla::paint::{Fill, LinearGradient, RadialGradient, SpreadMethod, Stop, Stroke, StrokeDash};
@@ -37,22 +38,47 @@ pub fn export(doc: &Document, opts: &PdfOptions) -> Result<Vec<u8>, PdfError> {
 /// Like [`export`], also returning warnings: options accepted but not applied yet (see
 /// [`crate::PdfSettings::warnings`]) and features approximated or dropped.
 pub fn export_with_report(doc: &Document, opts: &PdfOptions) -> Result<ExportReport, PdfError> {
+    write::guard(|| leaving_out_undecodable(|left_out| export_with_report_inner(doc, opts, left_out)))
+}
+
+/// Run `write` (a whole PDF written by a [`Writer`]), and run it again each time it fails on an
+/// image whose pixel data the writer couldn't decode, with that image left out: [`Writer::finish`]
+/// adds the image's key to the set `write` is given, and the exporters leave out the images it
+/// holds. The writer reports such an image (a PNG, GIF or WebP kept as it is, whose header reads)
+/// only when it finishes the file. Each repeated run leaves out at least one more image.
+pub(crate) fn leaving_out_undecodable<T>(mut write: impl FnMut(&mut HashSet<String>) -> Result<T, PdfError>) -> Result<T, PdfError> {
+    let mut left_out = HashSet::new();
+    loop {
+        let known = left_out.len();
+        match write(&mut left_out) {
+            Err(_) if left_out.len() > known => {}
+            done => return done,
+        }
+    }
+}
+
+fn export_with_report_inner(doc: &Document, opts: &PdfOptions, left_out: &mut HashSet<String>) -> Result<ExportReport, PdfError> {
     let set = &opts.settings;
     set.check()?;
+    vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
     // Live geometry effects export as their result; raster effects are reported below.
     let baked = vectorcraft_effects::bake_document(doc);
+    // Baking stops early when cancelled, leaving a half-baked copy that must not be written.
+    vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
     let doc = baked.as_ref().unwrap_or(doc);
     let pages = pages(doc, opts)?;
 
     let title = crate::pdfx::title(set.standard, opts.title.clone().unwrap_or_else(|| doc.title.clone()));
-    let created_at = opts.created.or_else(vectorcraft_doc::metadata::now_unix);
+    // The time of writing (none on the web) dates the editing data and the page information.
+    let now = vectorcraft_doc::metadata::output_time();
+    let created_at = opts.created.or(now);
     crate::pdfx::require_date(set.standard, created_at)?;
     let mut w = Writer::new(doc, set, &title, created_at, doc.color_mode == vectorcraft_doc::ColorMode::Cmyk)?;
     // Preserve Editing: the native document as an embedded file (`check` refused PDF/A with it).
     let mut warnings = set.warnings();
     let native = opts.native.as_deref().filter(|_| set.preserve_editing);
     if let Some(native) = native {
-        w.pdf.embed_file(crate::editing::embedded_file(native, set.compression.compress_text, created_at.map(date_time)));
+        w.pdf.document_mut().embed_file(crate::editing::embedded_file(native, set.compression.compress_text, now.map(date_time)));
     } else if set.preserve_editing {
         warnings.push("Preserve editing needs the native document, which wasn't given: the PDF reopens as plain artwork".into());
     }
@@ -60,6 +86,7 @@ pub fn export_with_report(doc: &Document, opts: &PdfOptions) -> Result<ExportRep
     let mut ex = Exporter::new(doc, set);
     ex.non_printing = set.include_non_printing || set.create_layers;
     ex.out = w.out.clone();
+    ex.left_out = left_out.clone();
     // A knockout page group draws the layers' objects one by one, not layer by layer.
     ex.layers = set.writes_layers() && !doc.page_knockout;
     if set.writes_layers() && doc.page_knockout {
@@ -68,14 +95,27 @@ pub fn export_with_report(doc: &Document, opts: &PdfOptions) -> Result<ExportRep
     ex.overprint = set.advanced.overprint == crate::Overprint::Preserve;
     let bleed = set.bleed_of(doc);
     let marks = set.marks.printer_marks();
-    for (i, boxes) in pages {
+    // In PDF 1.6 and later files that aren't PDF/X files, a page with a side longer than
+    // [`MAX_PAGE_SIDE`] is written in larger units; other files have every page in points.
+    let scales = set.compatibility.has_user_unit() && !set.standard.is_pdfx();
+    let mut units = Vec::with_capacity(pages.len());
+    let total = pages.len() as u64;
+    for (written, (i, boxes)) in pages.into_iter().enumerate() {
+        // The page count and the page being written, for a client that asked for progress.
+        vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
+        vectorcraft_doc::cancel::progress(written as u64 + 1, total, &format!("Writing page {} of {total}", written + 1));
         let (m, r) = (boxes.media, boxes.bleed);
-        let info = if marks.page_info { crate::marks::page_info(doc, &title, i, created_at) } else { String::new() };
+        let info = if marks.page_info { crate::marks::page_info(doc, &title, i, now) } else { String::new() };
         let art = crate::marks::art(doc, &marks, &boxes, bleed, &info);
-        // The page is the media box, y down from its top-left corner (like ours).
-        let view = Affine::translate((-m.x0, -m.y0));
+        // The page is the media box, y down from its top-left corner (like ours), in units of
+        // `unit` points.
+        let unit = if scales { user_unit(m.width(), m.height()) } else { 1.0 };
+        units.push(unit);
+        let shift = Affine::translate((-m.x0, -m.y0));
+        let view = if unit > 1.0 { Affine::scale(1.0 / unit) * shift } else { shift };
         let sheet = Sheet {
-            size: (m.width(), m.height()),
+            size: (m.width() / unit, m.height() / unit),
+            unit,
             trim: view.transform_rect_bbox(boxes.trim),
             bleed: view.transform_rect_bbox(r),
             view,
@@ -89,11 +129,20 @@ pub fn export_with_report(doc: &Document, opts: &PdfOptions) -> Result<ExportRep
         };
         w.page(&mut ex, &sheet).map_err(|_| PdfError::BadArtboard(i))?;
     }
-    let (layers, overprinted) = (ex.layers, ex.overprinted);
+    vectorcraft_doc::cancel::check().map_err(|_| PdfError::Cancelled)?;
+    let (layers, overprinted, invisible) = (ex.layers, ex.overprinted, ex.invisible);
     w.absorb(ex);
-    let (bytes, more) = w.finish()?;
-    let bytes = crate::forms::finish(bytes, doc, set, layers, overprinted)?;
+    let (bytes, more) = w.finish(left_out)?;
+    let bytes = crate::forms::finish(bytes, doc, set, layers, overprinted, invisible)?;
+    // The writer gives the file its creation date as its modification date too.
+    let bytes = match opts.modified.filter(|m| Some(*m) != created_at) {
+        Some(modified) => crate::post::modification_date(bytes, modified)?,
+        None => bytes,
+    };
+    // The writer's metadata has no copyright: it is added to the XMP packet.
+    let bytes = crate::post::rights(bytes, &doc.metadata)?;
     warnings.extend(more);
+    let bytes = crate::post::user_units(bytes, &units)?;
     let bytes = crate::post::finish(bytes, opts, native.is_some(), &mut warnings)?;
     warnings.dedup();
     Ok(ExportReport { bytes, warnings })
@@ -120,10 +169,58 @@ pub fn page_areas(doc: &Document, opts: &PdfOptions) -> Result<Vec<Rect>, PdfErr
     Ok(pages(doc, opts)?.into_iter().map(|(_, b)| b.media).collect())
 }
 
+/// The largest side of a page in units of its default user space that ISO 32000-1 (Annex C.2)
+/// gives: 14,400 (200 inches in units of 1/72 inch).
+pub(crate) const MAX_PAGE_SIDE: f64 = 14_400.0;
+
+/// The `UserUnit` (PDF 1.6) of a page `w` × `h` points large: 1 when both sides are at most
+/// [`MAX_PAGE_SIDE`], else the longer side divided by it, rounded up to the next thousandth, so
+/// that both sides are at most [`MAX_PAGE_SIDE`] units.
+fn user_unit(w: f64, h: f64) -> f64 {
+    let side = w.abs().max(h.abs());
+    if side.is_finite() && side > MAX_PAGE_SIDE { (side / MAX_PAGE_SIDE * 1000.0).ceil() / 1000.0 } else { 1.0 }
+}
+
+/// The RGB colours and non-CMYK images a CMYK document carries, which the export separates into
+/// CMYK. Their darkest values come out as rich blacks, so the export says how many there are.
+#[derive(Default)]
+pub(crate) struct RgbInCmyk {
+    /// Distinct RGB colours, by the bits of their channels.
+    colours: HashSet<[u32; 3]>,
+    /// Keys of the raster images that aren't CMYK.
+    images: HashSet<String>,
+}
+
+impl RgbInCmyk {
+    fn merge(&mut self, other: RgbInCmyk) {
+        self.colours.extend(other.colours);
+        self.images.extend(other.images);
+    }
+
+    /// The warning for the export report; `None` when the document has nothing of the sort.
+    fn warning(&self) -> Option<String> {
+        let (c, i) = (self.colours.len(), self.images.len());
+        if c == 0 && i == 0 {
+            return None;
+        }
+        let mut parts = vec![];
+        if c > 0 {
+            parts.push(format!("{c} RGB colour{}", if c == 1 { "" } else { "s" }));
+        }
+        if i > 0 {
+            parts.push(format!("{i} RGB or grey image{}", if i == 1 { "" } else { "s" }));
+        }
+        Some(format!(
+            "this CMYK document has {}: they are converted to CMYK through the colour settings, so dark ones can come out as rich blacks on several plates; paint them with CMYK colours (Edit › Edit Colors › Convert to CMYK) for pure black ink",
+            parts.join(" and ")
+        ))
+    }
+}
+
 /// A PDF being written, shared by export and print: the file's configuration and metadata, then
 /// its pages ([`Self::page`]), each drawn by an [`Exporter`].
 pub(crate) struct Writer {
-    pub pdf: krilla::Document,
+    pub pdf: write::Writer,
     /// How colours are written (the Output settings).
     pub out: Arc<ColorOut>,
     /// Groups blend in CMYK (a CMYK document's composite, or converting to CMYK; see
@@ -132,15 +229,23 @@ pub(crate) struct Writer {
     /// Spot colours written with a Lab alternate, gathered from the exporters ([`Self::absorb`]).
     lab_spots: Vec<(String, vectorcraft_color::cms::Lab)>,
     warnings: Vec<String>,
+    /// RGB content of a CMYK document, gathered from the exporters ([`Self::absorb`]).
+    rgb_in_cmyk: RgbInCmyk,
     /// A PDF 1.3 file ([`crate::PdfSettings::pdf13`]): flat, without page groups.
     pdf13: bool,
+    /// The document's images the exporters wrote, by key, gathered from the exporters
+    /// ([`Self::absorb`]): [`Self::finish`] finds the key of an image the writer couldn't decode.
+    images: Vec<(String, Image)>,
 }
 
 /// One page as [`Writer::page`] draws it: the art placed in a drawing space ([`Self::place`]),
 /// which [`Self::view`] maps onto the page.
 pub(crate) struct Sheet<'a> {
-    /// The page's size in points.
+    /// The page's size in its units.
     pub size: (f64, f64),
+    /// The size of the page's unit in points (its `UserUnit`): a page in points has 1. A side is
+    /// written at least 1 pt long.
+    pub unit: f64,
     /// The TrimBox and BleedBox, in page space (y down from the top-left corner).
     pub trim: Rect,
     pub bleed: Rect,
@@ -166,7 +271,7 @@ impl Writer {
     /// CMYK (unless the colours are converted to RGB).
     pub(crate) fn new(doc: &Document, set: &crate::PdfSettings, title: &str, created: Option<i64>, cmyk: bool) -> Result<Self, PdfError> {
         let out = ColorOut::new(doc, set)?;
-        let mut warnings = vec![];
+        let mut warnings = out.profile_notes.clone();
         // Tagged CMYK colours need the profile (PDF/A tags every colour).
         let cmyk_profile = if out.tagged { out.cmyk_icc() } else { None };
         if out.tagged && cmyk_profile.is_none() {
@@ -180,12 +285,9 @@ impl Writer {
             Compatibility::Pdf17 => PdfVersion::Pdf17,
             Compatibility::Pdf20 => PdfVersion::Pdf20,
         };
-        let mut cb = ConfigurationBuilder::new().with_version(version);
         // `check` has refused the standards (and standard/version pairs) the writer can't produce.
-        if set.standard == Standard::PdfA2b {
-            cb = cb.with_archival_validator(Archival::A2_B);
-        }
-        let configuration = cb.finish().map_err(|e| PdfError::Write(format!("{e:?}")))?;
+        let archival = (set.standard == Standard::PdfA2b).then_some(Archival::A2_B);
+        let configuration = write::configuration(version, archival)?;
         let settings = krilla::SerializeSettings {
             compress_content_streams: set.compression.compress_text,
             no_device_cs: out.tagged,
@@ -194,36 +296,38 @@ impl Writer {
             ..Default::default()
         };
 
-        let mut pdf = krilla::Document::new_with(settings);
-        let mut meta = Metadata::new().creator("VectorCraft".into()).producer("VectorCraft".into());
-        if !title.is_empty() {
-            meta = meta.title(title.to_string());
-        }
-        // File Info.
+        // File Info normalization stays with the application.
         let info = &doc.metadata;
         let given = |s: &str| Some(s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
-        if let Some(a) = given(&info.author) {
-            meta = meta.authors(vec![a]);
-        }
-        if let Some(d) = given(&info.description) {
-            meta = meta.description(d);
-        }
-        if !info.keywords.is_empty() {
-            meta = meta.keywords(info.keywords.clone());
-        }
-        if let Some(t) = created.map(date_time) {
-            meta = meta.creation_date(t);
-        }
-        pdf.set_metadata(meta);
-        Ok(Self { pdf, cmyk: out.blends_cmyk(cmyk), out: Arc::new(out), lab_spots: vec![], warnings, pdf13: set.pdf13() })
+        let metadata = Metadata {
+            creator: "VectorCraft".into(),
+            producer: "VectorCraft".into(),
+            title: Some(title.to_owned()),
+            authors: given(&info.author).into_iter().collect(),
+            description: given(&info.description),
+            keywords: info.keywords.clone(),
+            created: created.map(date_time),
+        };
+        let pdf = write::Writer::new(settings, metadata);
+        Ok(Self {
+            pdf,
+            cmyk: out.blends_cmyk(cmyk),
+            out: Arc::new(out),
+            lab_spots: vec![],
+            warnings,
+            rgb_in_cmyk: RgbInCmyk::default(),
+            pdf13: set.pdf13(),
+            images: vec![],
+        })
     }
 
     /// Draw one page: the art of `ex`'s document placed as `sheet` says, then its marks.
     pub(crate) fn page(&mut self, ex: &mut Exporter, sheet: &Sheet) -> Result<(), PdfError> {
         let (w, h) = sheet.size;
-        let size = Size::from_wh(w.max(1.0) as f32, h.max(1.0) as f32).ok_or_else(|| PdfError::BadSetting(format!("page size {w} × {h}")))?;
+        let least = 1.0 / sheet.unit;
+        let size = Size::from_wh(w.max(least) as f32, h.max(least) as f32).ok_or_else(|| PdfError::BadSetting(format!("page size {w} × {h}")))?;
         let at = |b: Rect| krilla::geom::Rect::from_ltrb(b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32);
-        let mut page = self.pdf.start_page_with(PageSettings::new(size).with_trim_box(at(sheet.trim)).with_bleed_box(at(sheet.bleed)));
+        let mut page = self.pdf.document_mut().start_page_with(PageSettings::new(size).with_trim_box(at(sheet.trim)).with_bleed_box(at(sheet.bleed)));
         let mut s = page.surface();
         let paper = Rect::new(0.0, 0.0, w, h);
         if sheet.negative {
@@ -247,12 +351,13 @@ impl Writer {
         }
         // Page Isolated Blending / Page Knockout Group: the page content is one group (the PDF
         // writer has no page group attributes; a flat PDF 1.3 file has none). In CMYK, transparency
-        // at the top of a page is put in a non-isolated group of its own, whose blending space
-        // `cmyk_blending` rewrites.
+        // at the top of a page is put in a group of its own, whose blending space `cmyk_blending`
+        // rewrites: non-isolated only when blending on the page reaches the paper, since some
+        // readers (CoreGraphics) drop most of a page in a non-isolated group (#2156).
         let doc = ex.doc;
         let page_group = fits && !self.pdf13 && (doc.page_isolate || doc.page_knockout);
         let cmyk_page_group = fits && self.cmyk && !page_group && ex.shows_transparency();
-        if page_group {
+        if page_group || (cmyk_page_group && !Node::children_blend(&doc.layers, &mut |c| c.blends_through())) {
             s.push_isolated();
         } else if cmyk_page_group {
             let all = constant_mask(&mut s, r, 1.0);
@@ -295,25 +400,41 @@ impl Writer {
         Ok(())
     }
 
-    /// Take an exporter's warnings and Lab spot colours once its pages are drawn.
+    /// Take an exporter's warnings, Lab spot colours and images once its pages are drawn.
     pub(crate) fn absorb(&mut self, ex: Exporter) {
         for w in ex.warnings {
             if !self.warnings.contains(&w) {
                 self.warnings.push(w);
             }
         }
+        self.rgb_in_cmyk.merge(ex.rgb_in_cmyk);
         for spot in ex.lab_spots {
             if !self.lab_spots.iter().any(|(n, _)| *n == spot.0) {
                 self.lab_spots.push(spot);
+            }
+        }
+        // The exporter caches images by their key, followed by their size and mask after a NUL.
+        for (cache, image) in ex.images {
+            if let (Some(key), Some(image)) = (cache.split('\0').next(), image) {
+                self.images.push((key.to_string(), image));
             }
         }
     }
 
     /// The finished file (with the output intent and Trapped entries, and checked against its
     /// standard) and the warnings of its drawing. PDF/X-1a spot colours keep their CMYK
-    /// alternates.
-    pub(crate) fn finish(mut self) -> Result<(Vec<u8>, Vec<String>), PdfError> {
-        let mut bytes = self.pdf.finish().map_err(|e| PdfError::Write(format!("{e:?}")))?;
+    /// alternates. When the writer couldn't decode one of the images, its key is added to
+    /// `left_out` ([`leaving_out_undecodable`]) and the writer's error is returned.
+    pub(crate) fn finish(mut self, left_out: &mut HashSet<String>) -> Result<(Vec<u8>, Vec<String>), PdfError> {
+        let images = std::mem::take(&mut self.images);
+        let mut bytes = self.pdf.finish().map_err(|e| {
+            if let write::WriteError::Serialization(k) = &e
+                && let krilla::error::KrillaError::Image(failed, ..) = &**k
+            {
+                left_out.extend(images.iter().filter(|(_, image)| image == failed).map(|(key, _)| key.clone()));
+            }
+            PdfError::from(e)
+        })?;
         if self.cmyk {
             cmyk_blending(&mut bytes, self.out.tagged);
         }
@@ -321,6 +442,7 @@ impl Writer {
         let bytes = if lab { crate::lab_spot::lab_alternates(bytes, &self.lab_spots) } else { bytes };
         let (bytes, more) = self.out.write_catalog(bytes)?;
         self.warnings.extend(more);
+        self.warnings.extend(self.rgb_in_cmyk.warning());
         Ok((crate::pdfx::finish(bytes, self.out.standard, self.pdf13)?, self.warnings))
     }
 }
@@ -447,6 +569,9 @@ pub(crate) struct Exporter<'a> {
     lab_spots: Vec<(String, vectorcraft_color::cms::Lab)>,
     /// Images may ask viewers to smooth them (not in PDF/A).
     interpolate: bool,
+    /// Images may have 16 bits a sample (PDF 1.5 and later); in earlier files they are written at
+    /// 8 bits ([`embed`]).
+    sixteen_bit: bool,
     /// How images are resampled and compressed.
     compression: &'a crate::CompressionSettings,
     /// Layers whose Print option is off are written too.
@@ -459,6 +584,8 @@ pub(crate) struct Exporter<'a> {
     pub out: Arc<ColorOut>,
     /// Colours are converted to the destination (printer's marks aren't).
     convert: bool,
+    /// RGB colours and images of a CMYK document drawn so far.
+    rgb_in_cmyk: RgbInCmyk,
     /// Text as glyph outlines; else the characters' fills are real text in embedded fonts.
     outline_text: bool,
     /// The fonts real text is written in, by face id, with their units per em; `None` for faces
@@ -475,13 +602,22 @@ pub(crate) struct Exporter<'a> {
     pub overprint: bool,
     /// An overprinting fill or stroke was drawn so.
     pub overprinted: bool,
+    /// Characters with neither fill nor stroke were written as text in forms marked invisible.
+    pub invisible: bool,
     /// Inline graphics being drawn inside inline graphics (text in a symbol shown inline in
     /// text…): deeper ones are left out.
     inline_depth: u32,
+    /// Keys of the images left out because the writer couldn't decode them
+    /// ([`leaving_out_undecodable`]).
+    pub left_out: HashSet<String>,
 }
 
 /// How deep inline graphics nest before they are left out.
 const MAX_INLINE_DEPTH: u32 = 4;
+
+/// The warning for an image left out because it can't be decoded: the note raster exports give
+/// (`vectorcraft-engine`'s `rasterfx::undecoded_warning`).
+const UNDECODED: &str = "an image couldn't be decoded and is missing from the picture";
 
 impl<'a> Exporter<'a> {
     /// An exporter of `doc` writing images as `set` says; layers whose Print option is off are
@@ -496,12 +632,15 @@ impl<'a> Exporter<'a> {
             knockout: doc.page_knockout,
             lab_spots: vec![],
             interpolate: set.standard != Standard::PdfA2b,
+            // PDF 1.3 and 1.4 files are written with the PDF 1.4 settings ([`Writer::new`]).
+            sixteen_bit: !matches!(set.compatibility, Compatibility::Pdf13 | Compatibility::Pdf14),
             compression: &set.compression,
             non_printing: false,
             intent: vectorcraft_color::cms::active().settings().intent,
             transparent: None,
             out: Arc::default(),
             convert: true,
+            rgb_in_cmyk: RgbInCmyk::default(),
             outline_text: set.advanced.outline_text,
             fonts: HashMap::new(),
             layers: false,
@@ -509,7 +648,9 @@ impl<'a> Exporter<'a> {
             in_layer: 0,
             overprint: false,
             overprinted: false,
+            invisible: false,
             inline_depth: 0,
+            left_out: HashSet::new(),
         }
     }
 
@@ -667,9 +808,12 @@ fn rects_overlap(a: Rect, b: Rect) -> bool {
 impl Exporter<'_> {
     /// A colour for the page, as the Output settings write it ([`ColorOut::color`]): without
     /// conversion, RGB and Lab colours of CMYK documents are separated into CMYK through the
-    /// active colour settings, so the file carries press values.
+    /// document's colour spaces, so the file carries press values.
     fn col(&mut self, c: &Color) -> krilla::color::Color {
         let cmyk_doc = self.doc.color_mode == vectorcraft_doc::ColorMode::Cmyk;
+        if let (true, true, Color::Rgb { r, g, b }) = (cmyk_doc, self.convert, c) {
+            self.rgb_in_cmyk.colours.insert([r.to_bits(), g.to_bits(), b.to_bits()]);
+        }
         let c = self.out.color(c, self.intent, cmyk_doc, self.convert);
         if let (Color::Rgb { .. }, Some(note)) = (c, &self.out.srgb_note) {
             let note = note.clone();
@@ -1004,8 +1148,13 @@ impl Exporter<'_> {
             }
             pushes += 1;
         }
-        if let Some(m) = n.extras().mask.as_deref()
-            && !m.disabled
+        let mask = n.extras().mask.as_deref().filter(|m| !m.disabled);
+        let alpha = match (&n.kind, mask) {
+            (NodeKind::Image(im), Some(m)) => self.masked_image(im, m),
+            _ => None,
+        };
+        if let Some(m) = mask
+            && alpha.is_none()
         {
             let mask = self.soft_mask(s, m, page);
             s.push_mask(mask);
@@ -1046,7 +1195,7 @@ impl Exporter<'_> {
                 self.shape(s, n, &bp, *rule, page);
             }
             NodeKind::Text(t) => self.text(s, n, t, page),
-            NodeKind::Image(im) => self.image(s, im),
+            NodeKind::Image(im) => self.image(s, im, alpha),
             NodeKind::SymbolInstance { symbol, xf } => {
                 if let Some(sym) = self.doc.symbols.iter().find(|x| &x.name == symbol) {
                     let mut art = (*sym.art).clone();
@@ -1055,7 +1204,12 @@ impl Exporter<'_> {
                 }
             }
             // Live blends/envelopes/meshes export their evaluated (expanded) form.
-            NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) | NodeKind::PlacedDocument(_) => {
+            NodeKind::Blend { .. }
+            | NodeKind::Envelope { .. }
+            | NodeKind::Mesh(_)
+            | NodeKind::Repeat(_)
+            | NodeKind::PlacedDocument(_)
+            | NodeKind::Intertwine { .. } => {
                 let g = vectorcraft_effects::expand_live_deep(Some(self.doc), n);
                 for c in g.children().into_iter().flatten() {
                     self.node(s, c, page, false);
@@ -1384,11 +1538,13 @@ impl Exporter<'_> {
         // pushed for each fill and stroke of the characters, inside its form when the fill or
         // stroke overprints.
         let text_space = xf(t.xf);
-        let plain = (!self.outline_text).then(|| t.plain_text());
+        // Ruby can't be real text in one run (it isn't characters of the base text): the type's
+        // characters go out as outlines where ruby is present, ruby included.
+        let plain = (!self.outline_text && t.ruby.is_empty()).then(|| t.plain_text());
         let bars = vectorcraft_text::decorations(&layout, vectorcraft_text::FontDb::global(), t);
         for (i, run) in t.runs.iter().enumerate() {
             let mut bp = BezPath::new();
-            for g in layout.glyphs.iter().filter(|g| g.run == i) {
+            for g in layout.glyphs.iter().filter(|g| g.run == i).chain(layout.ruby.iter().filter(|g| g.run == i)) {
                 bp.extend(g.outline.iter());
             }
             // Underline and strikethrough bars are paths, with real text too (#847).
@@ -1420,6 +1576,18 @@ impl Exporter<'_> {
                 }
                 s.pop();
             });
+            // Characters with neither fill nor stroke (a scanned page's recognized text) are still
+            // text: written invisible (rendering mode 3), so they can still be selected and searched.
+            if let Some(text) = plain.as_deref().filter(|_| fill.is_none() && !run.style.has_stroke()) {
+                self.invisible = true;
+                crate::forms::form(s, Mark::Invisible, |s| {
+                    s.push_transform(&text_space);
+                    // The paint only lets the writer write the text; the glyphs it can't write
+                    // as text draw nothing.
+                    self.glyph_text(s, &layout, i, text, &Paint::solid(Color::gray(0.0)));
+                    s.pop();
+                });
+            }
             s.push_transform(&text_space);
             let path = run.style.has_stroke().then(|| to_path(s, &bp)).flatten();
             s.pop();
@@ -1578,13 +1746,13 @@ impl Exporter<'_> {
             Embedding::Subset => {
                 // A named instance of a variable font is embedded instanced (its own outlines and
                 // widths, not the default instance's).
-                let coords: Vec<(krilla::text::Tag, f32)> = face.variations().iter().map(|(t, v)| (krilla::text::Tag::new(t), *v)).collect();
-                let font =
-                    krilla::text::Font::new_variable(face.file_data().to_vec().into(), face.face_index(), &coords).map(|f| (f, face.units_per_em()));
-                if font.is_none() {
-                    self.warn(format!("the font “{name}” can't be embedded: its text is exported as outlines"));
+                match write::font(face.file_data(), face.face_index(), Some(face.variations())) {
+                    Ok(font) => Some((font, face.units_per_em())),
+                    Err(error) => {
+                        self.warn(format!("the font “{name}” can't be embedded ({error}): its text is exported as outlines"));
+                        None
+                    }
                 }
-                font
             }
             Embedding::Whole => {
                 self.warn(format!(
@@ -1603,7 +1771,8 @@ impl Exporter<'_> {
 
     /// Image `key` placed `size` points wide and high, resampled and compressed as the Compression
     /// settings say ([`crate::images::recode`], [`crate::images::recode_cmyk`] for CMYK images);
-    /// cached by key (and size when images are resampled).
+    /// cached by key (and size when images are resampled). `None`, with [`UNDECODED`] among the
+    /// warnings, for an image that is missing, can't be decoded or is in [`Self::left_out`].
     fn load_image(&mut self, key: &str, size: (f64, f64)) -> Option<Image> {
         let c = self.compression;
         let sized = [c.color.downsample, c.gray.downsample, c.mono.downsample].iter().any(|d| *d != crate::Downsample::None);
@@ -1614,33 +1783,66 @@ impl Exporter<'_> {
         let interpolate = self.interpolate;
         let doc = self.doc;
         let out = self.out.clone();
-        let img = doc.images.get(key).and_then(|blob| {
-            let r = if blob.is_cmyk() {
-                crate::images::recode_cmyk(blob, size, c, interpolate, out.cmyk_pixels())
+        let img = doc.images.get(key).filter(|_| !self.left_out.contains(key)).and_then(|blob| {
+            let cmyk_image = blob.is_cmyk();
+            if !cmyk_image && self.convert && doc.color_mode == vectorcraft_doc::ColorMode::Cmyk {
+                self.rgb_in_cmyk.images.insert(key.to_string());
+            }
+            let r = if cmyk_image {
+                crate::images::recode_cmyk(blob, size, c, interpolate, out.cmyk_pixels(), None)
             } else {
                 crate::images::recode(&blob.bytes, size, c, interpolate, out.pixels())
             };
             if let Some(w) = r.warning {
                 self.warn(w);
             }
-            r.image.or_else(|| embed(blob, interpolate))
+            r.image.or_else(|| embed(blob, interpolate, self.sixteen_bit))
         });
         if img.is_none() {
-            self.warn(format!("image '{key}' could not be decoded and was skipped"));
+            self.warn(UNDECODED);
         }
         self.images.insert(cache, img.clone());
         img
     }
 
-    fn image(&mut self, s: &mut Surface, im: &vectorcraft_doc::ImageObject) {
+    /// CMYK image `im` with the alpha of its opacity mask `m`, when the mask is a greyscale image
+    /// on the image's own pixel grid (an image's soft mask as it opens): the alpha is written as the
+    /// image's soft mask, as an RGBA image's is, rather than as a luminosity soft mask over it,
+    /// through which CoreGraphics draws CMYK images on black boxes (#2159). `None` for other
+    /// images and masks; cached like [`Self::load_image`].
+    fn masked_image(&mut self, im: &vectorcraft_doc::ImageObject, m: &vectorcraft_doc::OpacityMask) -> Option<Image> {
+        let art = &m.art;
+        let NodeKind::Image(mi) = &art.kind else { return None };
+        let plain =
+            art.opacity >= 1.0 && art.blend == BlendMode::Normal && art.extras().mask.is_none() && !art.appearance.effects.iter().any(|e| e.visible);
+        if m.invert || !plain || (mi.xf, mi.width, mi.height) != (im.xf, im.width, im.height) {
+            return None;
+        }
+        let size = placed_size(im);
+        let cache = format!("{}\u{0}{}\u{0}{}\u{0}{:.3}x{:.3}", im.key, mi.key, m.clip, size.0, size.1);
+        if let Some(i) = self.images.get(&cache) {
+            return i.clone();
+        }
+        let doc = self.doc;
+        let img = doc.images.get(&im.key).filter(|b| b.is_cmyk()).and_then(|blob| {
+            let alpha = crate::images::mask_alpha(doc.images.get(&mi.key)?, im.width, im.height, m.clip)?;
+            let r = crate::images::recode_cmyk(blob, size, self.compression, self.interpolate, self.out.cmyk_pixels(), Some(alpha));
+            if let (Some(w), Some(_)) = (r.warning, &r.image) {
+                self.warn(w);
+            }
+            r.image
+        });
+        self.images.insert(cache, img.clone());
+        img
+    }
+
+    /// Draw image `im`: `img` when given (its pixels already written), else as it is loaded.
+    fn image(&mut self, s: &mut Surface, im: &vectorcraft_doc::ImageObject, img: Option<Image>) {
         // An image placed or sized beyond [`MAX_COORD`] is left out.
         if !writable(s, im.xf, Rect::new(0.0, 0.0, im.width.max(1).into(), im.height.max(1).into())) {
             return;
         }
-        // The size it is placed at: its pixel grid's sides through its transform.
-        let [a, b, c, d, ..] = im.xf.as_coeffs();
-        let size = (im.width as f64 * a.hypot(b), im.height as f64 * c.hypot(d));
-        let Some(img) = self.load_image(&im.key, size) else { return };
+        let Some(img) = img.or_else(|| self.load_image(&im.key, placed_size(im))) else { return };
         let Some(size) = Size::from_wh(im.width.max(1) as f32, im.height.max(1) as f32) else { return };
         s.push_transform(&xf(im.xf));
         s.draw_image(img, size);
@@ -1648,11 +1850,47 @@ impl Exporter<'_> {
     }
 }
 
+/// The size image `im` is placed at: its pixel grid's sides through its transform.
+fn placed_size(im: &vectorcraft_doc::ImageObject) -> (f64, f64) {
+    let [a, b, c, d, ..] = im.xf.as_coeffs();
+    (im.width as f64 * a.hypot(b), im.height as f64 * c.hypot(d))
+}
+
+/// Does PNG `bytes` have 16 bits a sample: the bit depth of its IHDR chunk, which follows the
+/// signature?
+fn png_16_bit(bytes: &[u8]) -> bool {
+    bytes.get(12..16) == Some(b"IHDR".as_slice()) && bytes.get(24) == Some(&16)
+}
+
+/// PNG `bytes` at 8 bits a sample: decoded, and encoded again as gray or RGB, with alpha when the
+/// source has it, and with the source's ICC profile. `None` when it can't be decoded.
+fn png_8_bit(bytes: &[u8]) -> Option<Vec<u8>> {
+    use image::{ColorType, DynamicImage, ImageDecoder, ImageEncoder};
+    let mut decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let img = DynamicImage::from_decoder(decoder).ok()?;
+    let img = match img.color() {
+        ColorType::L8 | ColorType::L16 => DynamicImage::ImageLuma8(img.into_luma8()),
+        ColorType::La8 | ColorType::La16 => DynamicImage::ImageLumaA8(img.into_luma_alpha8()),
+        ColorType::Rgb8 | ColorType::Rgb16 => DynamicImage::ImageRgb8(img.into_rgb8()),
+        _ => DynamicImage::ImageRgba8(img.into_rgba8()),
+    };
+    let mut png = vec![];
+    let mut encoder = image::codecs::png::PngEncoder::new(&mut png);
+    if let Some(icc) = icc {
+        encoder.set_icc_profile(icc).ok()?;
+    }
+    img.write_with_encoder(encoder).ok()?;
+    Some(png)
+}
+
 /// Image `blob` as it is: PNG, JPEG, GIF and WebP through the PDF writer (JPEG data unchanged),
-/// other formats decoded.
-fn embed(blob: &vectorcraft_doc::ImageBlob, interpolate: bool) -> Option<Image> {
+/// other formats decoded. Without `sixteen_bit` (a file before PDF 1.5), a PNG of 16 bits a
+/// sample is written at 8 bits ([`png_8_bit`]).
+fn embed(blob: &vectorcraft_doc::ImageBlob, interpolate: bool, sixteen_bit: bool) -> Option<Image> {
     let bytes = blob.bytes.as_ref().clone();
     let direct = match blob.mime.as_str() {
+        "image/png" if !sixteen_bit && png_16_bit(&bytes) => png_8_bit(&bytes).and_then(|png| Image::from_png(png.into(), interpolate).ok()),
         "image/png" => Image::from_png(bytes.clone().into(), interpolate).ok(),
         "image/jpeg" | "image/jpg" => Image::from_jpeg(bytes.clone().into(), interpolate).ok(),
         "image/gif" => Image::from_gif(bytes.clone().into(), interpolate).ok(),
@@ -1689,5 +1927,23 @@ mod tests {
         s.pop();
         s.finish();
         page.finish();
+    }
+
+    #[test]
+    fn a_16_bit_png_at_8_bits_keeps_its_color_type_and_icc_profile() {
+        use image::{ImageDecoder, ImageEncoder};
+        let icc = vectorcraft_color::cms::icc_bytes(vectorcraft_color::cms::GRAY).unwrap().to_vec();
+        let gray = image::DynamicImage::ImageLuma16(image::ImageBuffer::from_fn(4, 2, |x, y| image::Luma([x as u16 * 20000 + y as u16])));
+        let mut png = vec![];
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut png);
+        encoder.set_icc_profile(icc.clone()).unwrap();
+        gray.write_with_encoder(encoder).unwrap();
+        assert!(png_16_bit(&png));
+        let out = png_8_bit(&png).unwrap();
+        assert!(!png_16_bit(&out));
+        let mut decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(out.as_slice())).unwrap();
+        assert_eq!(decoder.icc_profile().unwrap(), Some(icc));
+        assert_eq!(decoder.color_type(), image::ColorType::L8);
+        assert_eq!(image::DynamicImage::from_decoder(decoder).unwrap().to_luma8(), gray.to_luma8());
     }
 }

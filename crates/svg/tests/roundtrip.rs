@@ -387,6 +387,18 @@ fn text_roundtrip_and_escaping() {
 }
 
 #[test]
+fn text_with_control_characters_exports_well_formed_svg() {
+    // A pasted manual line break (U+000B) or other C0 control character is not allowed in XML 1.0.
+    let t = TextObject::point(Point::new(20.0, 50.0), "A\u{0}\u{8}B\u{b}C\u{fffe}D", CharStyle::default());
+    let id = Document::new(200.0, 200.0).alloc_id();
+    let d = doc_with(vec![Node::new(id, NodeKind::Text(Box::new(t)))]);
+    let s = export(&d, &ExportOptions::default());
+    let r = import(&s).unwrap_or_else(|e| panic!("exported SVG doesn't import: {e:?}"));
+    let NodeKind::Text(t) = &art(&r)[0].kind else { panic!() };
+    assert_eq!(t.plain_text(), "AB CD");
+}
+
+#[test]
 fn scaled_text_roundtrips_at_the_size_it_draws() {
     // Type scaled with its object (its transform scales it) comes back at the size it draws at,
     // drawn the same, and stays so on the next round trip; a stretch stays the transform.
@@ -453,6 +465,31 @@ fn text_on_path_options_svg_cannot_express_are_outlined() {
         let id = d.alloc_id();
         let svg = export(&doc_with(vec![Node::new(id, NodeKind::Text(Box::new(t)))]), &ExportOptions::default());
         assert!(!svg.contains("<textPath"), "{set}: {svg}");
+    }
+}
+
+/// Type on a path whose punctuation hangs outside its brackets (Optical Margin Alignment or Roman
+/// Hanging Punctuation) keeps its look as outlines; with the option on and nothing at its ends to
+/// hang, it stays a `<textPath>`.
+#[test]
+fn text_on_path_with_hanging_punctuation_is_outlined() {
+    let mut curve = vectorcraft_geom::BezPath::new();
+    curve.move_to((20.0, 150.0));
+    curve.curve_to((60.0, 40.0), (140.0, 40.0), (180.0, 150.0));
+    for (text, optical, roman, live) in [
+        ("“On a curve", true, false, false),
+        ("“On a curve", false, true, false),
+        ("On a curve", true, true, true),
+        ("“On a curve", false, false, true),
+    ] {
+        let mut d = Document::new(200.0, 200.0);
+        let mut t = TextObject::point(Point::ZERO, text, CharStyle { size: 14.0, ..CharStyle::default() });
+        t.kind = TextKind::OnPath { path: PathData::from_bezpath(&curve), start: 0.1, end: None };
+        t.optical_margin = optical;
+        t.para.roman_hanging = roman;
+        let id = d.alloc_id();
+        let svg = export(&doc_with(vec![Node::new(id, NodeKind::Text(Box::new(t)))]), &ExportOptions::default());
+        assert_eq!(svg.contains("<textPath"), live, "{text} {optical} {roman}: {svg}");
     }
 }
 

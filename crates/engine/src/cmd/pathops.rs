@@ -22,7 +22,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Unite",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Unite)
         ),
@@ -31,7 +31,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Minus Front",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::MinusFront)
         ),
@@ -40,7 +40,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Intersect",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Intersect)
         ),
@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Exclude",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Exclude)
         ),
@@ -58,7 +58,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Divide",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Divide)
         ),
@@ -67,7 +67,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Trim",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Trim)
         ),
@@ -76,7 +76,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Merge",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Merge)
         ),
@@ -85,7 +85,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Crop",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_multi,
             |s, _| run_pf(s, PathfinderOp::Crop)
         ),
@@ -94,7 +94,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Outline",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Outline)
         ),
@@ -103,7 +103,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Minus Back",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::MinusBack)
         ),
@@ -130,7 +130,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Simplify…",
             ["Object", "Path"],
             None,
-            "{tolerance?: pt (1), cornerAngle?: deg (30), straightLines?: bool} → {ids, before, after} anchor counts",
+            "{tolerance?: pt (1), level?: 0..100 (the Simplify slider, in place of tolerance: 0 fewest anchor points, 50 is 1 pt, every 10 levels halves or doubles it), auto?: bool (Auto-Simplify: the lowest level whose tolerance is at most 1/400 of the selection's longer side, or 100 when that side is under 12.5 pt), cornerAngle?: deg (30), straightLines?: bool} → {ids, before, after} anchor counts, and the level used with level or auto",
             has_selection,
             simplify
         ),
@@ -381,6 +381,8 @@ fn pf_label(op: PathfinderOp) -> &'static str {
         PathfinderOp::Crop => "Crop",
         PathfinderOp::Outline => "Outline",
         PathfinderOp::MinusBack => "Minus Back",
+        PathfinderOp::HardMix => "Hard Mix",
+        PathfinderOp::SoftMix => "Soft Mix",
     }
 }
 
@@ -582,9 +584,9 @@ pub(crate) fn with_transparency(d: &mut Document, mut n: Node, opacity: f32, ble
     n
 }
 
-/// The art stroke `st` of a path (`path`, `rule`) paints, as fills: its brush art, or the
-/// outline of the stroke (as on the canvas) filled with the stroke's paint, opacity, blend mode
-/// and effects (a gradient along or across the stroke: gradient meshes in a clip group shaped
+/// The art stroke `st` of a path (`path`, `rule`) paints, as fills: its brush art (with the
+/// stroke's opacity, blend mode and raster effects), or the outline of the stroke (as on the canvas)
+/// filled with the stroke's paint, opacity, blend mode and effects (a gradient along or across the stroke: gradient meshes in a clip group shaped
 /// like the outline). `None` when it paints nothing.
 pub(crate) fn outlined_stroke(
     d: &mut Document,
@@ -601,7 +603,15 @@ pub(crate) fn outlined_stroke(
             _ => Node::group(NodeId(0), pieces.into_iter().map(Arc::new).collect()),
         };
         let art = d.reid(&art);
-        return Some(with_transparency(d, art, st.opacity, st.blend));
+        let mut art = with_transparency(d, art, st.opacity, st.blend);
+        let raster: Vec<_> = st.effects.iter().filter(|e| !vectorcraft_render::effects::is_geometry(&e.id)).cloned().collect();
+        if !raster.is_empty() {
+            if !art.appearance.effects.is_empty() {
+                art = Node::group(d.alloc_id(), vec![Arc::new(art)]);
+            }
+            art.appearance.effects = raster;
+        }
+        return Some(art);
     }
     let outline = vectorcraft_render::effects::stroke::outline_region(path, rule, st);
     if outline.is_empty() {
@@ -673,12 +683,13 @@ pub(crate) fn styled_copy(d: &mut Document, l: &Node, items: Vec<AppearanceItem>
     f
 }
 
-/// What stands for object `l` once its appearance became `parts` (paint order): the one part or a
-/// group of them, with `l`'s transparency, name, opacity mask and effects. `None` without parts.
+/// What stands for object `l` once its appearance became `parts` (paint order): the one part (in a
+/// group when it has effects of its own) or a group of them, with `l`'s transparency, name, opacity
+/// mask and effects. `None` without parts.
 pub(crate) fn assemble(d: &mut Document, l: &Node, mut parts: Vec<Node>) -> Option<Node> {
     let root = match parts.len() {
         0 => return None,
-        1 => parts.remove(0),
+        1 if parts[0].appearance.effects.is_empty() => parts.remove(0),
         _ => Node::group(d.alloc_id(), parts.into_iter().map(Arc::new).collect()),
     };
     let mut root = with_transparency(d, root, l.opacity, l.blend);
@@ -791,13 +802,29 @@ fn edit_paths(s: &mut Session, label: &str, f: impl Fn(&PathData) -> PathData) -
 }
 
 fn simplify(s: &mut Session, p: &Value) -> Result<Value> {
+    // With auto, the slider's level is Auto-Simplify's for the selection's size; otherwise it is the level given.
+    let level = if bool_or(p, "auto", false) {
+        let roots = selected_roots(s)?;
+        let size = s.doc()?.doc.bounds_of(&roots, false).map_or(0.0, |b| b.width().max(b.height()));
+        Some(po::auto_simplify_level(size))
+    } else {
+        num_param(p, "level").map(|l| if l.is_finite() { l.round().clamp(0.0, 100.0) } else { po::SIMPLIFY_LEVEL })
+    };
+    let tolerance = match level {
+        Some(l) => po::simplify_level_tolerance(l),
+        None => len_param(p, "tolerance").unwrap_or(1.0),
+    };
     let opts = po::SimplifyOptions {
-        tolerance: len_param(p, "tolerance").unwrap_or(1.0).clamp(1e-4, 1e4),
+        tolerance: tolerance.clamp(1e-4, 1e4),
         corner_angle_deg: num_param(p, "cornerAngle").unwrap_or(30.0).clamp(0.0, 180.0),
         straight_lines: bool_or(p, "straightLines", false),
     };
     let (ids, before, after) = edit_paths(s, "Simplify", |path| po::simplify_with(path, &opts))?;
-    Ok(json!({ "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>(), "before": before, "after": after }))
+    let mut out = json!({ "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>(), "before": before, "after": after });
+    if let Some(l) = level {
+        out["level"] = json!(l);
+    }
+    Ok(out)
 }
 
 fn add_anchor_points(s: &mut Session, _: &Value) -> Result<Value> {
@@ -921,7 +948,8 @@ fn clean_up(s: &mut Session, p: &Value) -> Result<Value> {
         for l in &d.layers {
             visit(l, false, false, false, &mut v, (stray, unpainted, empty_text));
         }
-        v.retain(|id| d.is_editable(*id));
+        let editable = d.editable();
+        v.retain(|id| editable(*id));
         v
     };
     if found.is_empty() {
@@ -966,13 +994,15 @@ fn divide_objects_below(s: &mut Session, _: &Value) -> Result<Value> {
         }
         // Compound children are handled via their compound.
         targets.retain(|id| !matches!(d.parent_of(*id).and_then(|p| d.node(p)).map(|p| &p.kind), Some(NodeKind::Compound { .. })));
+        let editable = d.editable();
         targets.retain(|id| {
             *id != cutter_id
-                && d.is_editable(*id)
+                && editable(*id)
                 && d.is_visible(*id)
                 && d.index_path(*id).is_some_and(|ip| ip < cutter_pos)
                 && d.node(*id).and_then(Node::geometric_bounds).is_some_and(|b| b.intersect(cb).area() > 0.0)
         });
+        drop(editable);
         let mut out = vec![];
         let mut cut = Beside::replacing(d, &[targets.as_slice(), &[cutter_id]].concat());
         for t in targets {

@@ -1,6 +1,8 @@
-//! Type → Threaded Text: one story flowing through area-type frames in order.
+//! Type → Threaded Text: one story flowing through frames in order: area type and type on a path,
+//! in any mix. Illustrator links type objects of any shape, as long as their text is in an area or
+//! along a path, not at a point (<https://helpx.adobe.com/illustrator/using/manage-text-area.html>).
 //!
-//! Frames are ordinary area text objects holding their slice of the story; the document lists the
+//! Frames are ordinary text objects holding their slice of the story; the document lists the
 //! thread order. After every edit, threads whose frames changed are re-flowed ([`reflow`]).
 
 use serde_json::{Value, json};
@@ -17,9 +19,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create",
             ["Type", "Threaded Text"],
             None,
-            "{} thread the selected area type (and closed paths, which become frames) in stacking order → {ids}",
+            "{} thread the selected area type and type on a path (and closed paths, which become area frames) in stacking order → {ids}",
             has_multi,
             create
+        ),
+        cmd!(
+            "text.thread.add",
+            "Thread Text",
+            [],
+            None,
+            "{from, to?, rect?: [x, y, width, height], at?: [x, y]} thread area type or type on a path `from` (a click on its out port) into one more frame, put after it in its thread: closed path, area type or type on a path `to`, a new rectangle `rect`, or a new frame of `from`'s kind, shape and size with its top-left at `at` (give one of the three) → {id}; the two frames are selected",
+            has_doc,
+            add
         ),
         cmd!(
             "text.thread.releaseSelection",
@@ -55,9 +66,10 @@ fn has_thread_selection(s: &Session) -> std::result::Result<(), String> {
     }
 }
 
+/// The text object `id` when it can be a frame of a thread: area type or type on a path.
 fn text_of(d: &Document, id: NodeId) -> Option<&TextObject> {
     match d.node(id).map(|n| &n.kind) {
-        Some(NodeKind::Text(t)) if matches!(t.kind, TextKind::Area { .. }) => Some(t),
+        Some(NodeKind::Text(t)) if !matches!(t.kind, TextKind::Point) => Some(t),
         _ => None,
     }
 }
@@ -128,6 +140,7 @@ pub(crate) fn reflow(before: &Document, doc: &mut Document) {
                 }
             }
         }
+        let optical = if live.len() >= 2 { optical_margin(before, doc, &live) } else { None };
         let frames: Vec<TextObject> = live.iter().filter_map(|id| text_of(doc, *id).cloned()).collect();
         let refs: Vec<&TextObject> = frames.iter().collect();
         let parts = vectorcraft_text::thread::distribute(vectorcraft_text::FontDb::global(), &refs, &story, &paras);
@@ -136,10 +149,12 @@ pub(crate) fn reflow(before: &Document, doc: &mut Document) {
                 let mut next = (**t).clone();
                 next.runs = part.runs;
                 next.set_paragraph_styles(part.paras);
-                if next.runs != t.runs || next.para != t.para || next.paras != t.paras {
+                let optical = optical.unwrap_or(t.optical_margin);
+                if next.runs != t.runs || next.para != t.para || next.paras != t.paras || optical != t.optical_margin {
                     t.runs = next.runs;
                     t.para = next.para;
                     t.paras = next.paras;
+                    t.optical_margin = optical;
                     refresh_bounds(t);
                 }
             }
@@ -151,8 +166,46 @@ pub(crate) fn reflow(before: &Document, doc: &mut Document) {
     doc.text_threads = kept;
 }
 
+/// The Optical Margin Alignment setting that every frame of a thread with the frames `live` takes:
+/// that of the first frame whose setting changed between `before` and `doc`, else the first frame's.
+fn optical_margin(before: &Document, doc: &Document, live: &[NodeId]) -> Option<bool> {
+    let now = |id: &NodeId| text_of(doc, *id).map(|t| t.optical_margin);
+    let changed = live.iter().find(|id| text_of(before, **id).is_some_and(|t| Some(t.optical_margin) != now(id)));
+    changed.or(live.first()).and_then(now)
+}
+
+/// Give every frame of each thread the first frame's Optical Margin Alignment setting, without
+/// re-flowing the story: for a document restored from a file as it was saved.
+pub(crate) fn share_optical_margin(doc: &mut Document) {
+    for thread in doc.text_threads.clone() {
+        let live: Vec<NodeId> = thread.into_iter().filter(|id| text_of(doc, *id).is_some()).collect();
+        let Some(on) = optical_margin(doc, doc, &live) else { continue };
+        for id in &live {
+            if let Some(NodeKind::Text(t)) = doc.node_mut(*id).map(|n| &mut n.kind)
+                && t.optical_margin != on
+            {
+                t.optical_margin = on;
+                refresh_bounds(t);
+            }
+        }
+    }
+}
+
+/// `ids` followed by the other frames of the threads they are in, each once, in thread order.
+pub(crate) fn with_threads(d: &Document, ids: &[NodeId]) -> Vec<NodeId> {
+    let mut out = ids.to_vec();
+    for thread in d.text_threads.iter().filter(|t| t.iter().any(|id| ids.contains(id))) {
+        for id in thread {
+            if !out.contains(id) && text_of(d, *id).is_some() {
+                out.push(*id);
+            }
+        }
+    }
+    out
+}
+
 /// A closed path converted to an empty area-type frame with `style`.
-fn frame_from_path(n: &Node, style: vectorcraft_doc::CharStyle) -> Option<Node> {
+fn frame_from_path(n: &Node, style: vectorcraft_doc::CharStyle, system_layout: bool) -> Option<Node> {
     let NodeKind::Path { path, .. } = &n.kind else { return None };
     if !path.subpaths.first().is_some_and(|s| s.closed) {
         return None;
@@ -160,6 +213,7 @@ fn frame_from_path(n: &Node, style: vectorcraft_doc::CharStyle) -> Option<Node> 
     let mut t = TextObject::point(vectorcraft_geom::Point::ZERO, "", style);
     t.kind = TextKind::Area { frame: path.clone() };
     t.xf = vectorcraft_geom::Affine::IDENTITY;
+    t.system_layout = system_layout;
     refresh_bounds(&mut t);
     Some(Node::new(n.id, NodeKind::Text(Box::new(t))))
 }
@@ -169,7 +223,8 @@ fn create(s: &mut Session, _: &Value) -> Result<Value> {
     let ids = selected_roots(s)?;
     let d = &s.doc()?.doc;
     let style = ids.iter().find_map(|i| text_of(d, *i)).map(|t| t.first_style()).unwrap_or_default();
-    let ok = ids.iter().all(|i| text_of(d, *i).is_some() || d.node(*i).is_some_and(|n| frame_from_path(n, style.clone()).is_some()));
+    let system = d.setup.system_layout;
+    let ok = ids.iter().all(|i| text_of(d, *i).is_some() || d.node(*i).is_some_and(|n| frame_from_path(n, style.clone(), system).is_some()));
     if ids.len() < 2 || !ok || !ids.iter().any(|i| text_of(d, *i).is_some()) {
         return Err(bad(C, "select area type and closed paths (at least one area type object)"));
     }
@@ -178,7 +233,7 @@ fn create(s: &mut Session, _: &Value) -> Result<Value> {
         for id in &ids {
             if text_of(d, *id).is_none() {
                 let n = d.node(*id).cloned().ok_or(EngineError::NoNode(*id))?;
-                let f = frame_from_path(&n, style.clone()).ok_or_else(|| bad(C, "not a closed path"))?;
+                let f = frame_from_path(&n, style.clone(), d.setup.system_layout).ok_or_else(|| bad(C, "not a closed path"))?;
                 *d.node_mut(*id).ok_or(EngineError::NoNode(*id))? = f;
             }
         }
@@ -203,6 +258,99 @@ fn create(s: &mut Session, _: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(json!({ "ids": out.iter().map(|i| i.0).collect::<Vec<_>>() }))
+}
+
+/// `text.thread.add`: the out port's loaded text, placed.
+fn add(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "text.thread.add";
+    let given = |k: &str| p.get(k).filter(|v| !v.is_null());
+    let from = checked_id(s, given("from").unwrap_or(&Value::Null), C)?;
+    let d = &s.doc()?.doc;
+    let src = text_of(d, from).ok_or_else(|| bad(C, "`from` must be area type or type on a path"))?;
+    let style = src.first_style();
+    // The frame to thread into: an existing object (`to`), or a new one beside `from`.
+    let (to, new) = match (given("to"), given("rect"), given("at")) {
+        (Some(v), None, None) => {
+            let to = checked_id(s, v, C)?;
+            let parent = d.parent_of(to).and_then(|i| d.node(i));
+            let system = d.setup.system_layout;
+            let frame = text_of(d, to).is_some() || d.node(to).is_some_and(|n| frame_from_path(n, style.clone(), system).is_some());
+            if to == from || !frame || parent.is_some_and(|n| matches!(n.kind, NodeKind::Compound { .. })) {
+                return Err(bad(C, "`to` must be a closed path, area type or type on a path other than `from`"));
+            }
+            if d.text_threads.iter().any(|t| t.contains(&to)) {
+                return Err(bad(C, "`to` is already threaded"));
+            }
+            (to, None)
+        }
+        (None, Some(v), None) => {
+            let [x, y, w, h] = finite_numbers(v)
+                .filter(|[_, _, w, h]| *w > 0.0 && *h > 0.0)
+                .ok_or_else(|| bad(C, "`rect` must be [x, y, width, height] with a positive size"))?;
+            let frame = vectorcraft_geom::shapes::rectangle(vectorcraft_geom::Rect::new(0.0, 0.0, w, h));
+            (NodeId(0), Some(empty_frame(src, style.clone(), TextKind::Area { frame }, vectorcraft_geom::Affine::translate((x, y)))))
+        }
+        (None, None, Some(v)) => {
+            let [x, y] = finite_numbers(v).ok_or_else(|| bad(C, "`at` must be [x, y]"))?;
+            let shape = match &src.kind {
+                TextKind::Area { frame } => frame,
+                TextKind::OnPath { path, .. } => path,
+                TextKind::Point => return Err(bad(C, "`from` must be area type or type on a path")),
+            };
+            let b = shape.bounds().map(|b| src.xf.transform_rect_bbox(b)).ok_or_else(|| bad(C, "`from` has an empty frame"))?;
+            let xf = vectorcraft_geom::Affine::translate((x - b.x0, y - b.y0)) * src.xf;
+            (NodeId(0), Some(empty_frame(src, style.clone(), src.kind.clone(), xf)))
+        }
+        _ => return Err(bad(C, "give one of `to`, `rect` or `at`")),
+    };
+    let appearance = d.node(from).map(|n| n.appearance.clone());
+    let id = s.edit("Thread Text", |d, sel| {
+        let to = match new {
+            Some(t) => {
+                let (parent, idx, _) = d.position(from).ok_or(EngineError::NoNode(from))?;
+                let id = d.alloc_id();
+                let mut n = Node::new(id, NodeKind::Text(Box::new(t)));
+                if let Some(a) = appearance {
+                    n.appearance = a;
+                }
+                d.insert(parent, idx + 1, n)?;
+                id
+            }
+            None => {
+                if text_of(d, to).is_none() {
+                    let n = d.node(to).cloned().ok_or(EngineError::NoNode(to))?;
+                    *d.node_mut(to).ok_or(EngineError::NoNode(to))? =
+                        frame_from_path(&n, style, d.setup.system_layout).ok_or_else(|| bad(C, "not a closed path"))?;
+                }
+                to
+            }
+        };
+        match d.text_threads.iter_mut().find(|t| t.contains(&from)) {
+            Some(t) => {
+                let at = t.iter().position(|x| *x == from).map_or(t.len(), |i| i + 1);
+                t.insert(at, to);
+            }
+            None => d.text_threads.push(vec![from, to]),
+        }
+        // Force a re-flow of the thread on this edit: the edit leaves existing area type `to`
+        // unchanged.
+        touch(d, to);
+        sel.set([from, to]);
+        Ok(to)
+    })?;
+    Ok(json!({ "id": id.0 }))
+}
+
+/// An empty frame of `kind` (area type or type on a path) placed by `xf`, with the type options of
+/// `src`.
+fn empty_frame(src: &TextObject, style: vectorcraft_doc::CharStyle, kind: TextKind, xf: vectorcraft_geom::Affine) -> TextObject {
+    let mut t = src.clone();
+    t.runs = vec![TextRun { text: String::new(), style, inline: None }];
+    t.set_all_paras(src.para_at(0).clone());
+    t.kind = kind;
+    t.xf = xf;
+    refresh_bounds(&mut t);
+    t
 }
 
 /// Give a node a fresh allocation so [`reflow`] sees its thread as changed.
@@ -235,6 +383,16 @@ fn release(s: &mut Session, _: &Value) -> Result<Value> {
                     t.runs = vec![TextRun { text: String::new(), style: style.clone(), inline: None }];
                     t.set_all_paras(first_para.clone());
                     refresh_bounds(t);
+                }
+            }
+            // The first frame that stays holds the whole story, and the others none, for the
+            // re-flow to share it out among them once.
+            let end_style = story.last().map_or_else(|| style.clone(), |r| r.style.clone());
+            let last_para = paras.last().cloned().unwrap_or_default();
+            for id in keep.iter().skip(1) {
+                if let Some(NodeKind::Text(t)) = d.node_mut(*id).map(|n| &mut n.kind) {
+                    t.runs = vec![TextRun { text: String::new(), style: end_style.clone(), inline: None }];
+                    t.set_all_paras(last_para.clone());
                 }
             }
             if let Some(first) = keep.first()
@@ -413,6 +571,149 @@ mod tests {
         }
     }
 
+    fn new_id(v: Value) -> u64 {
+        v["id"].as_u64().unwrap()
+    }
+
+    fn threads(s: &Session) -> Vec<Vec<u64>> {
+        s.doc().unwrap().doc.text_threads.iter().map(|t| t.iter().map(|i| i.0).collect()).collect()
+    }
+
+    /// Bounds of area type `id`'s frame on the page.
+    fn frame_box(s: &Session, id: u64) -> vectorcraft_geom::Rect {
+        let Some(t) = text_of(&s.doc().unwrap().doc, NodeId(id)) else { panic!("not area type") };
+        let TextKind::Area { frame } = &t.kind else { panic!("not area type") };
+        t.xf.transform_rect_bbox(frame.bounds().unwrap())
+    }
+
+    /// #2572: the text loaded from an out port threads into a closed path, into a new frame of the
+    /// first one's shape and size at a point, and into a new rectangle, each in one undo step.
+    #[test]
+    fn add_threads_into_a_path_a_frame_at_a_point_and_a_rectangle() {
+        let (mut s, a, b) = setup();
+        assert_eq!(new_id(s.execute("text.thread.add", &json!({"from": a, "to": b})).unwrap()), b);
+        assert_eq!(threads(&s), [[a, b]]);
+        assert!(!text(&s, b).is_empty(), "the overflow flowed into the path");
+        assert_eq!(format!("{}{}", text(&s, a), text(&s, b)), TEXT.repeat(4));
+        assert_eq!(s.doc().unwrap().selection.objects, [NodeId(a), NodeId(b)]);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(threads(&s).is_empty());
+        assert!(matches!(s.doc().unwrap().doc.node(NodeId(b)).unwrap().kind, NodeKind::Path { .. }), "undo gives the path back");
+
+        let c = new_id(s.execute("text.thread.add", &json!({"from": a, "at": [400, 200]})).unwrap());
+        assert_eq!(frame_box(&s, c), vectorcraft_geom::Rect::new(400.0, 200.0, 550.0, 260.0), "the first frame's size, its top-left at the click");
+        let d = new_id(s.execute("text.thread.add", &json!({"from": c, "rect": [10, 100, 300, 150]})).unwrap());
+        assert_eq!(frame_box(&s, d), vectorcraft_geom::Rect::new(10.0, 100.0, 310.0, 250.0));
+        assert_eq!(threads(&s), [[a, c, d]], "each new frame comes after the one it was threaded from");
+        assert_eq!(format!("{}{}{}", text(&s, a), text(&s, c), text(&s, d)), TEXT.repeat(4));
+        assert!(!text(&s, d).is_empty());
+        // A frame threaded from the middle of a thread goes in after it.
+        let e = new_id(s.execute("text.thread.add", &json!({"from": a, "at": [0, 0]})).unwrap());
+        assert_eq!(threads(&s), [[a, e, c, d]]);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(s.doc().unwrap().doc.node(NodeId(e)).is_none());
+        assert_eq!(threads(&s), [[a, c, d]]);
+    }
+
+    /// Type on a path along a line beside the area type of [`setup`].
+    fn type_on_a_line(s: &mut Session) -> u64 {
+        let line = new_id(s.execute("shape.line", &json!({"x1": 10, "y1": 250, "x2": 110, "y2": 250})).unwrap());
+        new_id(s.execute("text.createInPath", &json!({"path": line, "mode": "onPath", "text": ""})).unwrap())
+    }
+
+    /// Type on a path threads as area type does, in any mix: a story flows from area type along a
+    /// path and on into area type, and a new frame threaded from type on a path at a point is type
+    /// on a path of the same shape.
+    #[test]
+    fn type_on_a_path_threads_with_area_type() {
+        let (mut s, a, b) = setup();
+        let on_path = type_on_a_line(&mut s);
+        s.execute("text.thread.add", &json!({"from": a, "to": on_path})).unwrap();
+        s.execute("text.thread.add", &json!({"from": on_path, "to": b})).unwrap();
+        assert_eq!(threads(&s), [[a, on_path, b]]);
+        let shares = [a, on_path, b].map(|id| text(&s, id));
+        assert!(shares.iter().all(|t| !t.is_empty()), "each frame takes a share: {shares:?}");
+        assert_eq!(shares.concat(), TEXT.repeat(4));
+
+        let c = new_id(s.execute("text.thread.add", &json!({"from": on_path, "at": [300, 250]})).unwrap());
+        let NodeKind::Text(t) = &s.doc().unwrap().doc.node(NodeId(c)).unwrap().kind else { panic!("not text") };
+        assert!(matches!(t.kind, TextKind::OnPath { .. }), "type on a path, as the frame it was threaded from");
+        assert_eq!(threads(&s), [[a, on_path, c, b]]);
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(threads(&s), [[a, on_path, b]]);
+    }
+
+    /// Type on a path released from its thread gives its text back to the frame before it.
+    #[test]
+    fn type_on_a_path_is_released_from_its_thread() {
+        let (mut s, a, _) = setup();
+        let on_path = type_on_a_line(&mut s);
+        s.execute("text.thread.add", &json!({"from": a, "to": on_path})).unwrap();
+        assert!(!text(&s, on_path).is_empty());
+        s.execute("select.set", &json!({"ids": [on_path]})).unwrap();
+        s.execute("text.thread.releaseSelection", &json!({})).unwrap();
+        assert!(threads(&s).is_empty());
+        assert!(text(&s, on_path).is_empty());
+        assert_eq!(text(&s, a), TEXT.repeat(4));
+    }
+
+    /// Area type threaded into from an out port takes the overflow at once, before its own text.
+    #[test]
+    fn add_into_area_type_flows_the_story_into_it() {
+        let (mut s, a, _) = setup();
+        let c = new_id(s.execute("text.create", &json!({"x": 10, "y": 100, "text": "Own text.", "area": {"width": 150, "height": 190}})).unwrap());
+        s.execute("text.thread.add", &json!({"from": a, "to": c})).unwrap();
+        assert_eq!(threads(&s), [[a, c]]);
+        assert_eq!(format!("{}{}", text(&s, a), text(&s, c)), format!("{}Own text.", TEXT.repeat(4)));
+        assert!(text(&s, c).len() > "Own text.".len(), "the overflow flowed into the frame: {:?}", text(&s, c));
+    }
+
+    #[test]
+    fn add_refuses_bad_params_and_leaves_the_document_alone() {
+        let (mut s, a, b) = setup();
+        let line = new_id(s.execute("shape.line", &json!({"x1": 0, "y1": 280, "x2": 50, "y2": 290})).unwrap());
+        let before = s.doc().unwrap().doc.clone();
+        for p in [
+            json!({"to": b}),
+            json!({"from": b, "at": [0, 0]}),
+            json!({"from": 9999, "at": [0, 0]}),
+            json!({"from": -1, "at": [0, 0]}),
+            json!({"from": a}),
+            json!({"from": a, "to": b, "at": [0, 0]}),
+            json!({"from": a, "to": a}),
+            json!({"from": a, "to": line}),
+            json!({"from": a, "to": 9999}),
+            json!({"from": a, "at": [0]}),
+            json!({"from": a, "at": ["1", 2]}),
+            json!({"from": a, "rect": [0, 0, -10, 10]}),
+            json!({"from": a, "rect": [0, 0, 10, 0]}),
+            json!({"from": a, "rect": [0, 0, 10]}),
+            json!({"from": a, "rect": "big"}),
+        ] {
+            assert!(s.execute("text.thread.add", &p).is_err(), "{p} was accepted");
+            assert!(std::sync::Arc::ptr_eq(&s.doc().unwrap().doc, &before), "{p} changed the document");
+        }
+        s.execute("text.thread.add", &json!({"from": a, "to": b})).unwrap();
+        let c = new_id(s.execute("text.create", &json!({"x": 10, "y": 200, "text": "x", "area": {"width": 50, "height": 20}})).unwrap());
+        assert!(s.execute("text.thread.add", &json!({"from": c, "to": b})).is_err(), "a frame already threaded");
+    }
+
+    /// A frame released from a thread that keeps two or more frames gives its text back to them:
+    /// the story flows through them once.
+    #[test]
+    fn release_from_a_longer_thread_keeps_the_story_once() {
+        let (mut s, a, b) = setup();
+        let c = new_id(s.execute("text.create", &json!({"x": 10, "y": 100, "text": "", "area": {"width": 150, "height": 40}})).unwrap());
+        s.execute("text.thread.add", &json!({"from": a, "to": c})).unwrap();
+        s.execute("text.thread.add", &json!({"from": c, "to": b})).unwrap();
+        assert_eq!(threads(&s), [[a, c, b]]);
+        s.execute("select.set", &json!({"ids": [c]})).unwrap();
+        s.execute("text.thread.releaseSelection", &json!({})).unwrap();
+        assert_eq!(threads(&s), [[a, b]]);
+        assert!(text(&s, c).is_empty());
+        assert_eq!(format!("{}{}", text(&s, a), text(&s, b)), TEXT.repeat(4));
+    }
+
     #[test]
     fn release_and_remove() {
         let (mut s, a, b) = setup();
@@ -427,5 +728,114 @@ mod tests {
         s.execute("text.thread.releaseSelection", &json!({})).unwrap();
         assert_eq!(text(&s, b), "");
         assert_eq!(text(&s, a), TEXT.repeat(4), "the story returns to the remaining frame");
+    }
+
+    /// A story of one-line paragraphs that each start with a quotation mark, threaded from area
+    /// type `a` into the rectangle `b`, which shows the paragraphs that `a` has no room for.
+    fn quoted_thread() -> (Session, u64, u64) {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"width": 600, "height": 300})).unwrap();
+        let story = "“Quoted.”\n".repeat(20);
+        let a = new_id(s.execute("text.create", &json!({"x": 10, "y": 10, "text": story, "area": {"width": 150, "height": 60}})).unwrap());
+        let b = new_id(s.execute("shape.rectangle", &json!({"x": 200, "y": 10, "width": 150, "height": 200})).unwrap());
+        s.execute("select.set", &json!({"ids": [a, b]})).unwrap();
+        s.execute("text.thread.create", &json!({})).unwrap();
+        assert!(text(&s, b).starts_with('“'));
+        (s, a, b)
+    }
+
+    /// Frame `id`'s Optical Margin Alignment setting, and whether its glyphs start left of its frame
+    /// (its lines' opening quotation marks hang).
+    fn optical(s: &Session, id: u64) -> (bool, bool) {
+        let Some(t) = text_of(&s.doc().unwrap().doc, NodeId(id)) else { panic!("not area type") };
+        let TextKind::Area { frame } = &t.kind else { panic!("not area type") };
+        (t.optical_margin, t.cached_bounds.unwrap().x0 < frame.bounds().unwrap().x0 - 1.0)
+    }
+
+    /// Optical Margin Alignment is a setting of the whole thread: Type › Optical Margin Alignment
+    /// in any frame sets it in every frame of the thread, in one undo step, and the lines in every
+    /// frame hang. Typing keeps it, and frames taken out of the thread keep it.
+    #[test]
+    fn optical_margin_alignment_is_set_for_every_frame_of_a_thread() {
+        let (mut s, a, b) = quoted_thread();
+        assert_eq!((optical(&s, a), optical(&s, b)), ((false, false), (false, false)));
+        s.execute("select.set", &json!({"ids": [a]})).unwrap();
+        let r = s.execute("type.opticalMarginAlignment", &json!({})).unwrap();
+        assert_eq!(r, json!({"on": true, "ids": [a, b]}));
+        assert_eq!((optical(&s, a), optical(&s, b)), ((true, true), (true, true)), "the second frame's lines hang too");
+        // Turned off from the second frame, it is off in both, and one undo turns it back on in both.
+        s.execute("select.set", &json!({"ids": [b]})).unwrap();
+        assert_eq!(s.execute("type.opticalMarginAlignment", &json!({})).unwrap()["on"], false);
+        assert_eq!((optical(&s, a), optical(&s, b)), ((false, false), (false, false)));
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!((optical(&s, a), optical(&s, b)), ((true, true), (true, true)));
+        // Typing in the first frame re-flows the story and keeps the setting.
+        s.execute("text.editRange", &json!({"id": a, "start": 0, "end": 0, "insert": "“New.”\n"})).unwrap();
+        assert_eq!((optical(&s, a), optical(&s, b)), ((true, true), (true, true)));
+        // Any edit that sets one frame sets the thread.
+        s.edit("Set", |d, _| {
+            let Some(NodeKind::Text(t)) = d.node_mut(NodeId(b)).map(|n| &mut n.kind) else { panic!("not text") };
+            t.optical_margin = false;
+            refresh_bounds(t);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((optical(&s, a), optical(&s, b)), ((false, false), (false, false)));
+        s.execute("edit.undo", &json!({})).unwrap();
+        // Released or unthreaded, each frame keeps it.
+        s.execute("select.set", &json!({"ids": [b]})).unwrap();
+        s.execute("text.thread.releaseSelection", &json!({})).unwrap();
+        assert_eq!((optical(&s, a).0, optical(&s, b).0), (true, true));
+        s.execute("edit.undo", &json!({})).unwrap();
+        s.execute("text.thread.remove", &json!({})).unwrap();
+        assert!(threads(&s).is_empty());
+        assert_eq!((optical(&s, a), optical(&s, b)), ((true, true), (true, true)));
+    }
+
+    /// Threading type into a thread gives the joined thread the setting of its first frame.
+    #[test]
+    fn a_thread_takes_its_first_frames_optical_margin_alignment() {
+        let (mut s, a, b) = quoted_thread();
+        s.execute("text.thread.remove", &json!({})).unwrap();
+        s.execute("type.opticalMarginAlignment", &json!({"ids": [a], "on": true})).unwrap();
+        assert_eq!((optical(&s, a).0, optical(&s, b).0), (true, false));
+        // Threaded again in stacking order: the second frame takes the first one's setting.
+        s.execute("select.set", &json!({"ids": [a, b]})).unwrap();
+        s.execute("text.thread.create", &json!({})).unwrap();
+        assert_eq!((optical(&s, a), optical(&s, b)), ((true, true), (true, true)));
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!((optical(&s, a).0, optical(&s, b).0), (true, false));
+        // From `b`'s out port into `a`: `a` joins `b`'s thread after it and takes its setting.
+        s.execute("text.thread.add", &json!({"from": b, "to": a})).unwrap();
+        assert_eq!(threads(&s), [[b, a]]);
+        assert_eq!((optical(&s, a).0, optical(&s, b).0), (false, false));
+        // A new frame threaded from a frame takes the thread's setting.
+        s.execute("type.opticalMarginAlignment", &json!({"ids": [a], "on": true})).unwrap();
+        let c = new_id(s.execute("text.thread.add", &json!({"from": a, "at": [400, 10]})).unwrap());
+        assert_eq!([a, b, c].map(|id| optical(&s, id).0), [true; 3]);
+    }
+
+    /// A file saved with the frames of one thread set differently opens with the first frame's
+    /// setting in every frame: a native file, and an EPS file restored from the document it carries.
+    #[test]
+    fn a_thread_saved_with_differing_frames_opens_with_the_first_frames_setting() {
+        let (mut s, a, b) = quoted_thread();
+        for (first, name) in [(true, "old.vectorcraft"), (false, "old.vectorcraft"), (true, "old.eps"), (false, "old.eps")] {
+            for (id, on) in [(a, first), (b, !first)] {
+                let doc = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().doc);
+                let Some(NodeKind::Text(t)) = doc.node_mut(NodeId(id)).map(|n| &mut n.kind) else { panic!("not text") };
+                t.optical_margin = on;
+            }
+            let bytes = if name.ends_with(".eps") {
+                let r = s.execute("document.exportEps", &json!({})).unwrap();
+                vectorcraft_format::base64_decode(r["dataBase64"].as_str().unwrap()).unwrap()
+            } else {
+                vectorcraft_format::save(&s.doc().unwrap().doc, false)
+            };
+            let r = s.execute("document.open", &json!({"name": name, "dataBase64": vectorcraft_format::base64_encode(&bytes)})).unwrap();
+            assert_eq!(r["restored"], name.ends_with(".eps"), "{r}");
+            assert_eq!(threads(&s), [[a, b]], "{name}");
+            assert_eq!((optical(&s, a), optical(&s, b)), ((first, first), (first, first)), "{name}, first frame {first}");
+        }
     }
 }
