@@ -98,7 +98,7 @@ fn the_scan_reads_collections_and_loads_fonts_only_when_used() {
     let db = FontDb::with_font_dirs(vec![dir.clone()]);
     assert_eq!(db.styles(FAMILY), ["Regular", "Bold"]);
     // Cataloged, not loaded.
-    assert!(!db.is_loaded(FAMILY));
+    assert!(!db.has_loaded_family(FAMILY));
     let bold = db.face(FAMILY, "Bold").unwrap();
     assert_eq!((bold.style.as_str(), bold.face_index()), ("Bold", 1));
     assert_eq!(db.find(FAMILY, "Regular").unwrap().face_index(), 0, "the collection's faces load together");
@@ -680,7 +680,7 @@ fn family_display_name_falls_back_to_localized_legacy_names() {
             assert_eq!(db.family_display_name("SimSun", true), "SimSun", "{source}, case {case}: English requested");
             assert_eq!(db.family_display_name("SimSun", false), expected, "{source}, case {case}: native requested");
             assert_eq!(db.family_display_name("SimSun", true), "SimSun", "{source}, case {case}: switch back to English");
-            assert_eq!(db.is_loaded("SimSun"), source == "loaded", "{source}, case {case}: catalog names need no face loading");
+            assert_eq!(db.has_loaded_family("SimSun"), source == "loaded", "{source}, case {case}: catalog names need no face loading");
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

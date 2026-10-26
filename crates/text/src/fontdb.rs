@@ -410,9 +410,20 @@ type PostScriptNames = HashMap<String, (String, String)>;
 /// are neither a loaded nor an installed family.
 type CanonicalNames = HashMap<(String, String), (String, String)>;
 
+/// Metadata for a face whose bytes a host supplies on demand through [`FontDb::add_font`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedFace {
+    pub family: String,
+    pub style: String,
+    pub weight: u16,
+    pub italic: bool,
+}
+
 /// Process-wide font database.
 pub struct FontDb {
     faces: RwLock<Vec<Arc<FontFace>>>,
+    served: RwLock<Vec<ServedFace>>,
+    requests: Mutex<Vec<(String, String)>>,
     outlines: Mutex<HashMap<(u32, u32), Arc<BezPath>>>,
     catalog: RwLock<Catalog>,
     /// The installed faces by PostScript name (documents name fonts so: PDF, EPS, .ai).
@@ -1645,6 +1656,8 @@ impl FontDb {
         }
         Self {
             faces: RwLock::new(faces),
+            served: RwLock::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
             outlines: Mutex::new(HashMap::new()),
             catalog: RwLock::new(Catalog::new()),
             postscript: RwLock::new(PostScriptNames::new()),
@@ -1689,6 +1702,66 @@ impl FontDb {
         self.faces.read().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Advertise host-provided faces without loading bytes or requesting them. Repeated
+    /// registration keeps the first metadata for a family and style, like loaded faces.
+    pub fn register_served_faces(&self, faces: Vec<ServedFace>) {
+        let mut changed = false;
+        {
+            let mut served = self.served.write().unwrap_or_else(|e| e.into_inner());
+            for face in faces {
+                if !face.family.trim().is_empty()
+                    && !face.style.trim().is_empty()
+                    && !served.iter().any(|f| f.family.eq_ignore_ascii_case(&face.family) && norm(&f.style) == norm(&face.style))
+                {
+                    served.push(face);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.changed();
+        }
+    }
+
+    /// Drain unresolved face requests. The host coalesces downloads and registers the whole
+    /// font file with [`Self::add_font`]. A later lookup can request a failed load again.
+    pub fn take_requests(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.requests.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Whether the requested face's bytes are already loaded; never loads or requests a font.
+    pub fn is_loaded(&self, family: &str, style: &str) -> bool {
+        let family = norm(family);
+        let style = norm(style);
+        self.read_faces()
+            .iter()
+            .any(|f| (norm(&f.family) == family || f.keys.families.contains(&family)) && (norm(&f.style) == style || f.keys.styles.contains(&style)))
+    }
+
+    fn request_served(&self, family: &str, style: &str) {
+        let request = {
+            let served = self.served.read().unwrap_or_else(|e| e.into_inner());
+            let matches = || served.iter().filter(|f| f.family.eq_ignore_ascii_case(family));
+            matches()
+                .find(|f| norm(&f.style) == norm(style))
+                .or_else(|| {
+                    let distance = |f: &ServedFace| {
+                        (f32::from(f.weight) - style_weight(style)).abs() + if f.italic != style_italic(style) { 250.0 } else { 0.0 }
+                    };
+                    matches().min_by(|a, b| distance(a).total_cmp(&distance(b)))
+                })
+                .map(|f| (f.family.clone(), f.style.clone()))
+        };
+        if let Some(request) = request
+            && !self.is_loaded(&request.0, &request.1)
+        {
+            let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+            if !requests.contains(&request) {
+                requests.push(request);
+            }
+        }
+    }
+
     fn read_catalog(&self) -> std::sync::RwLockReadGuard<'_, Catalog> {
         self.ensure_catalog();
         self.catalog.read().unwrap_or_else(|e| e.into_inner())
@@ -1722,6 +1795,7 @@ impl FontDb {
         }
         let mut v: Vec<String> = self.read_faces().iter().map(|f| f.family.clone()).collect();
         v.extend(catalog.values().map(|c| c.name.clone()));
+        v.extend(self.served.read().unwrap_or_else(|e| e.into_inner()).iter().map(|f| f.family.clone()));
         v.sort_by_key(|a| a.to_lowercase());
         v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
         let list: Arc<[String]> = v.into();
@@ -1779,6 +1853,11 @@ impl FontDb {
                 if !v.iter().any(|(_, _, s)| s.eq_ignore_ascii_case(&cf.style)) {
                     v.push((cf.italic, cf.weight, cf.style.clone()));
                 }
+            }
+        }
+        for f in self.served.read().unwrap_or_else(|e| e.into_inner()).iter().filter(|f| f.family.eq_ignore_ascii_case(family)) {
+            if !v.iter().any(|(_, _, style)| norm(style) == norm(&f.style)) {
+                v.push((f.italic, f32::from(f.weight), f.style.clone()));
             }
         }
         v.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)));
@@ -1966,8 +2045,11 @@ impl FontDb {
     /// (`HiraginoSans-W6`, as PDF and `.ai` files name fonts). Case and anything but letters and
     /// digits are ignored. An unknown name is returned unchanged.
     pub fn canonical(&self, family: &str, style: &str) -> (String, String) {
-        if self.is_loaded(family) || self.read_catalog().contains_key(&family.to_ascii_lowercase()) {
+        if self.has_loaded_family(family) || self.read_catalog().contains_key(&family.to_ascii_lowercase()) {
             return (family.to_string(), style.to_string());
+        }
+        if let Some(face) = self.served.read().unwrap_or_else(|e| e.into_inner()).iter().find(|f| norm(&f.family) == norm(family)) {
+            return (face.family.clone(), style.to_string());
         }
         // The lock is held until the answer is kept, and [`FontDb::changed`] waits for it: an
         // answer found from the fonts before a change is cleared by that change.
@@ -2086,6 +2168,9 @@ impl FontDb {
         let found = self.find(family, style);
         if found.as_ref().is_some_and(|f| norm(&f.style) == norm(style)) {
             return found;
+        }
+        if !self.is_loaded(family, style) {
+            self.request_served(family, style);
         }
         // The family, or this style of it, is installed but not loaded yet. Looked for again
         // whether or not this call loaded it: another thread may have just done so (then this
@@ -2244,10 +2329,12 @@ impl FontDb {
     /// Is `family` available (loaded, or installed on the system)?
     pub fn has_family(&self, family: &str) -> bool {
         let (family, _) = self.canonical(family, "");
-        self.is_loaded(&family) || self.read_catalog().contains_key(&family.to_ascii_lowercase())
+        self.has_loaded_family(&family)
+            || self.read_catalog().contains_key(&family.to_ascii_lowercase())
+            || self.served.read().unwrap_or_else(|e| e.into_inner()).iter().any(|f| f.family.eq_ignore_ascii_case(&family))
     }
 
-    pub(crate) fn is_loaded(&self, family: &str) -> bool {
+    pub(crate) fn has_loaded_family(&self, family: &str) -> bool {
         self.read_faces().iter().any(|f| f.family.eq_ignore_ascii_case(family))
     }
 
@@ -2327,7 +2414,9 @@ impl FontDb {
         if families.is_empty() || !self.sys.lock().unwrap_or_else(|e| e.into_inner()).enabled {
             return false;
         }
-        families.iter().any(|fam| !self.is_loaded(fam) && self.load_cataloged(fam) && self.family_fallback(c, 0, &[fam], 400.0, false).is_some())
+        families
+            .iter()
+            .any(|fam| !self.has_loaded_family(fam) && self.load_cataloged(fam) && self.family_fallback(c, 0, &[fam], 400.0, false).is_some())
     }
 
     /// The first loaded family (the fallback family, then load order) with a face covering `c`,
@@ -2368,7 +2457,7 @@ impl FontDb {
         let scans = self.sys.lock().unwrap_or_else(|e| e.into_inner()).scans;
         let covered = |db: &FontDb| db.read_faces().iter().any(|f| f.covers(c));
         for fam in SYSTEM_FALLBACKS {
-            if !self.is_loaded(fam) && self.load_cataloged(fam) && covered(self) {
+            if !self.has_loaded_family(fam) && self.load_cataloged(fam) && covered(self) {
                 return true;
             }
         }
@@ -2433,6 +2522,47 @@ impl OutlinePen for FlipPen {
     }
     fn close(&mut self) {
         self.0.close_path();
+    }
+}
+
+#[cfg(test)]
+mod served_fonts_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_is_lazy_and_loading_a_variable_file_satisfies_its_named_styles() {
+        let db = FontDb::with_font_dirs(vec![]);
+        let family = crate::test_fonts::VARIABLE_FAMILY;
+        let before = db.family_list();
+        let generation = db.generation();
+        let listed = [("Regular", 400), ("SemiBold", 550), ("Bold", 700)]
+            .into_iter()
+            .map(|(style, weight)| ServedFace { family: family.into(), style: style.into(), weight, italic: false })
+            .collect();
+        db.register_served_faces(listed);
+        assert!(db.generation() > generation);
+        assert!(!before.iter().any(|f| f == family));
+        assert!(db.family_list().iter().any(|f| f == family));
+        assert!(db.has_family(family));
+        assert_eq!(db.styles(family), ["Regular", "SemiBold", "Bold"]);
+        assert_eq!(db.canonical(family, "Bold"), (family.into(), "Bold".into()));
+        assert!(!db.is_loaded(family, "Bold"));
+        assert!(db.take_requests().is_empty());
+        db.face(family, "Bold");
+        db.face(family, "Bold");
+        assert_eq!(db.take_requests(), [(family.into(), "Bold".into())]);
+        db.face(family, "Bold");
+        assert_eq!(db.take_requests().len(), 1, "a failed request can be retried");
+        assert!(db.add_font(crate::test_fonts::variable_font().unwrap()) >= 3);
+        for style in ["Regular", "SemiBold", "Bold"] {
+            assert!(db.is_loaded(family, style), "{style}");
+            assert_eq!(db.face(family, style).unwrap().family, family);
+        }
+        assert!(db.take_requests().is_empty());
+        // An existing face in this family does not satisfy a missing named style.
+        db.faces.write().unwrap().retain(|f| f.family != family || f.style != "Bold");
+        db.face(family, "Bold");
+        assert_eq!(db.take_requests(), [(family.into(), "Bold".into())]);
     }
 }
 

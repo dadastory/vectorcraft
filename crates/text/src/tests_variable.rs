@@ -121,7 +121,7 @@ fn installed_variable_fonts_list_their_instances_before_loading() {
     std::fs::write(dir.join("Varitest[wght].ttf"), font()).unwrap();
     let db = FontDb::with_font_dirs(vec![dir]);
     assert_eq!(db.styles(FAMILY), ["Regular", "SemiBold", "Bold"]);
-    assert!(!db.is_loaded(FAMILY), "listed from the name and fvar tables alone");
+    assert!(!db.has_loaded_family(FAMILY), "listed from the name and fvar tables alone");
     assert_eq!(db.by_postscript_name("VaritestSans-Bold"), Some((FAMILY.to_string(), "Bold".to_string())));
     let (bold, m) = db.resolve(FAMILY, "Bold").unwrap();
     assert_eq!((bold.style.as_str(), m), ("Bold", FontMatch::Exact));

@@ -604,6 +604,10 @@ thread_local! {
 /// on native (the worker asks for a frame when it is done), a few per frame; `None` until it is
 /// ready.
 fn sample_texture(ctx: &egui::Context, family: &str, style: Option<&str>, sample: Option<&str>, height: f32) -> Option<egui::TextureHandle> {
+    // Listing a served family must not download its file or cache a fallback as its sample.
+    if !vectorcraft_text::FontDb::global().is_loaded(family, style.unwrap_or("Regular")) {
+        return None;
+    }
     let px = (height * ctx.pixels_per_point()).round().clamp(8.0, 96.0) as u32;
     let key: Key = (family.to_string(), style.unwrap_or("Regular").to_string(), sample.unwrap_or_default().to_string(), px);
     let texture = |img: egui::ColorImage| ctx.load_texture(format!("font-sample-{family}-{px}"), img, egui::TextureOptions::LINEAR);
