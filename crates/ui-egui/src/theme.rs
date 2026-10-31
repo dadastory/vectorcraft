@@ -156,6 +156,9 @@ pub struct Tokens {
     pub highlight: Color32,
     /// The bleed outline around artboards (Document Setup → Bleed).
     pub bleed: Color32,
+    /// An artboard's Show Center Mark and Show Cross Hairs (Artboard Options), drawn over its
+    /// paper in every brightness.
+    pub artboard_mark: Color32,
     /// Error marks (a missing linked file).
     pub error: Color32,
     /// Warning marks (a modified linked file).
@@ -209,6 +212,7 @@ impl Tokens {
             caption_close_text: Color32::WHITE,
             highlight: hex(0xff3030),
             bleed: hex(0xf03030),
+            artboard_mark: hex(0x808080),
             error: hex(0xe34850),
             warning: hex(0xf0a330),
             axis_x: hex(0xef6058),
@@ -496,14 +500,23 @@ pub fn mono(size: f32) -> FontId {
 }
 
 /// Installs the interface's fonts and binds the families the panels and dialogs draw in
-/// ([`FONT_UI`], [`FONT_UI_SEMIBOLD`], [`FONT_MONO`]). egui panics drawing text in a family no font
-/// is bound to, so every context that shows them needs this once: [`crate::VectorcraftApp::logic`]
-/// calls it on its first frame, and an embedder that draws the panels or dialogs without it calls
-/// it when it makes the context. It replaces the context's font definitions: add other fonts after
-/// it, or keep these families in definitions of one's own. Without the `interface-fonts` feature
-/// the families are egui's built-in fonts (and craft-fonts' faces in a build with them), which lack
-/// some symbols the panels show (→ ▾ ● ✓).
+/// ([`FONT_UI`], [`FONT_UI_SEMIBOLD`], [`FONT_MONO`]). egui 0.37 only bundles its own faces when
+/// its `default_fonts` feature is on (this crate enables it); without any face a family lays out
+/// tofu, and the `egui_kittest` harness alone panics on a missing glyph. Every context that shows
+/// these families needs this once: [`crate::VectorcraftApp::ui`] calls it on its first pass, and
+/// an embedder that draws the panels or dialogs without it calls it when it makes the context. It
+/// replaces the context's font definitions: add other fonts after it, or keep these families in
+/// definitions of one's own. Without the `interface-fonts` feature the families are egui's built-in
+/// fonts (and craft-fonts' faces in a build with them), which lack some symbols the panels show
+/// (→ ▾ ● ✓).
 pub fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(interface_fonts());
+}
+
+/// The definitions [`install_fonts`] installs. [`crate::VectorcraftApp::ui`] keeps them to tell
+/// whether egui applied them at once or deferred them to the next pass (it must not take input
+/// or draw with fallback metrics while they are pending).
+pub fn interface_fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let (ui, semi, mono) = interface_faces(&mut fonts);
     let stack = |fonts: &FontDefinitions, family: FontFamily| fonts.families.get(&family).cloned().unwrap_or_default();
@@ -517,7 +530,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     fonts.families.insert(FontFamily::Name(FONT_UI.into()), family(ui, &fallback));
     fonts.families.insert(FontFamily::Name(FONT_MONO.into()), family(mono, &mono_fallback));
     add_craft_fonts(&mut fonts);
-    ctx.set_fonts(fonts);
+    fonts
 }
 
 /// The interface's own faces, added to `fonts`: the names of the regular, semibold and monospace

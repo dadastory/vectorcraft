@@ -145,6 +145,7 @@ pub const LANGUAGES: &[(&str, Quotes)] = &[
     ("French", Quotes { double: ['«', '»'], single: ['‹', '›'] }),
     ("Italian", Quotes { double: ['«', '»'], single: ['‘', '’'] }),
     ("Spanish", Quotes { double: ['«', '»'], single: ['‘', '’'] }),
+    ("Catalan", Quotes { double: ['«', '»'], single: ['‘', '’'] }),
     ("Portuguese", Quotes { double: ['«', '»'], single: ['‘', '’'] }),
     ("Dutch", Quotes { double: ['“', '”'], single: ['‘', '’'] }),
     ("Danish", Quotes { double: ['»', '«'], single: ['›', '‹'] }),
@@ -212,7 +213,8 @@ pub struct DocSetup {
     pub bleed: [f64; 4],
     /// Show Images in Outline Mode.
     pub outline_images: bool,
-    /// Highlight text whose font is missing (drawn in a substitute font).
+    /// The Highlight Substituted Fonts value older builds kept in Document Setup. Files keep it as
+    /// they were saved; the screen follows Preferences › Type › Highlight Substituted Fonts.
     pub highlight_substituted_fonts: bool,
     /// Highlight glyphs the font lacks (drawn from a fallback font).
     pub highlight_substituted_glyphs: bool,

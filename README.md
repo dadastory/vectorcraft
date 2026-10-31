@@ -206,10 +206,10 @@ the app with `WAYLAND_DISPLAY= vectorcraft`: the window then opens through XWayl
 (see [`docs/development.md`](docs/development.md#linux-wayland-and-x11)).
 
 On Linux with Wayland, under KDE Plasma 6.3 or later and under GNOME, VectorCraft doesn't respond to a drawing tablet's
-pen yet (#491, #2028). Open the window through XWayland instead, where the pen works as a mouse: set the same
-preference to **X11 (XWayland)**, or to **X11 (XWayland) When a Pen Is Attached** to use XWayland only when a pen is
-attached as VectorCraft starts, and restart; or start the app with `WAYLAND_DISPLAY= vectorcraft` (see
-[`docs/development.md`](docs/development.md#linux-wayland-and-x11)).
+pen yet (#491, #2028). Open the window through XWayland instead, where the pen works as a mouse and the app reads its
+pressure: set the same preference to **X11 (XWayland)**, or to **X11 (XWayland) When a Pen Is Attached** to use
+XWayland only when a pen is attached as VectorCraft starts, and restart; or start the app with
+`WAYLAND_DISPLAY= vectorcraft` (see [`docs/development.md`](docs/development.md#linux-wayland-and-x11)).
 
 ### Use it from Claude Code and other agents
 
@@ -226,8 +226,6 @@ claude mcp add vectorcraft -- /path/to/vectorcraft-cli mcp --automation-read-roo
 ```
 
 The details are in [`docs/mcp.md`](docs/mcp.md) and [`docs/control-protocol.md`](docs/control-protocol.md).
-
-For the experimental, unsupported 64-bit Windows 7 build, see [Windows 7 instructions](docs/windows7.md).
 
 ## Status
 
@@ -249,7 +247,7 @@ doesn't write Affinity files. Current `.af` validation includes 33 pinned files,
 and every-board SVG/PDF/PSD export, with fixes for Affinity 3 artboards, source-backed JPEGs and text runs.
 [Scope and limits](crates/affinity/README.md); [source audit and remaining gaps](docs/affinity-validation.md).
 The interface
-speaks English, German, Japanese, Korean, Vietnamese, Traditional and Simplified Chinese, Spanish, French, Hungarian, Italian, Polish, Brazilian Portuguese, Russian, Swedish, Ukrainian, Finnish, Bulgarian, Greek, Czech and Georgian;
+speaks English, German, Japanese, Korean, Vietnamese, Traditional and Simplified Chinese, Spanish, French, Hungarian, Italian, Polish, Brazilian Portuguese, Russian, Swedish, Ukrainian, Finnish, Bulgarian, Greek, Czech, Georgian and Catalan;
 [localization-parity.md](docs/localization-parity.md) has the details.
 The scores are self-assessed from our code against public documentation;
 [target-app-parity.md](docs/target-app-parity.md#how-this-was-measured-2026-10-10) explains how far to trust them.
@@ -258,7 +256,7 @@ The scores are self-assessed from our code against public documentation;
 - reliable exchange of .ai files (layer structure in real files; proprietary editing data isn't written);
 - an interaction-fidelity pass covering every tool's modifiers and small behaviours;
 - 3D and Materials beyond the initial live Revolve (Extrude & Bevel, Inflate, Rotate, materials);
-- the Effect Gallery (all 57 Photoshop-style raster filters are available, approximated, under Artistic, Blur, Brush Strokes, Distort, Pixelate, Sharpen, Sketch, Stylize, Texture and Video);
+- filter thumbnails and a preview area inside the Effect Gallery (the gallery itself and all 57 Photoshop-style raster filters, approximated, are in);
 - CJK composition for vertical type (vertical type itself has initial support, with a Japanese interface);
 - scripting, and the rest of Variables (image and graph kinds, dataset import);
 - generative AI features.

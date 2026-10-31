@@ -707,6 +707,32 @@ fn pdf_of(objs: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
+/// A file filling thousands of paths with function-based shadings, each a long PostScript
+/// calculator function of fine stripes, opens in bounded time: each shading is read once, and all
+/// of them within one budget of function evaluations per import (#3621 review).
+#[test]
+fn pdf_many_paths_filled_with_long_function_shadings_open_in_bounded_time() {
+    let shadings = 20;
+    // Five hundred no-op steps, then stripes: red, then white, along x.
+    let program = format!("{{ pop {}dup truncate sub 0.5 le {{ 1 0 0 }} {{ 1 1 1 }} ifelse }}", "1 mul ".repeat(500));
+    let patterns: String = (0..shadings)
+        .map(|i| format!("/P{i} << /PatternType 2 /Shading << /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 {} 0 1] /Matrix [1 0 0 100 0 0] /Function {} 0 R >> >> ", 200 + i, 5 + i))
+        .collect();
+    let functions: Vec<Vec<u8>> = (0..shadings)
+        .map(|i| {
+            format!("<< /FunctionType 4 /Domain [0 {} 0 1] /Range [0 1 0 1 0 1] /Length {} >>\nstream\n{program}\nendstream", 200 + i, program.len())
+                .into_bytes()
+        })
+        .collect();
+    let content: String = (0..5000).map(|i| format!("/Pattern cs /P{} scn {} {} 2 2 re f\n", i % shadings, i % 100 * 2, i / 100 * 2)).collect();
+    let pdf = handmade_pdf_with(&content, &format!("<< /Pattern << {patterns}>> >>"), "[0 0 200 100]", &functions);
+    let start = std::time::Instant::now();
+    let d = vectorcraft_pdf::import(&pdf).unwrap();
+    let took = start.elapsed();
+    assert!(!d.layers.is_empty());
+    assert!(took < std::time::Duration::from_secs(30), "took {took:?}");
+}
+
 /// One content-stream operation with junk operands.
 fn arb_pdf_op() -> impl Strategy<Value = String> {
     let op = prop::sample::select(vec![
@@ -846,9 +872,15 @@ proptest! {
             read = Some(r.as_ref().map(|d| d.layers.iter().any(|l| l.children().is_some_and(|c| !c.is_empty()))).map_err(ToString::to_string));
             r.ok()
         })?;
+        // A function written in the page's resources goes by the page's object (#4366).
+        let why = if function == "spaces past the cap" {
+            "a stream in it (object 3) would decode to more than 256 MB"
+        } else {
+            "a stream in it (object 3) has decode parameters that can't be applied"
+        };
         match read.expect("the import ran") {
             Ok(art) => prop_assert!(!refused && art, "{what}: opened (its art read: {art})"),
-            Err(e) => prop_assert!(refused && e.contains("would decode to more than 256 MB"), "{what}: {e}"),
+            Err(e) => prop_assert!(refused && e.contains(why), "{what}: {e}"),
         }
     }
 }
@@ -1115,16 +1147,22 @@ fn styles(what: &str, data: &str) -> Result<(), TestCaseError> {
 }
 
 /// Libraries panel library file `data` imported, then each kind's first item used on the rich
-/// document, moved into its first group and next to its kind's last item, the group moved and
-/// deleted and the library exported (#926).
+/// document, moved into its first group and next to its kind's last item, a colour and the
+/// selection added into that group next to the first ones, the group moved and deleted and the
+/// library exported (#926).
 fn libraries(what: &str, data: &str) -> Result<(), TestCaseError> {
     survive_library(what, "library.import", data, |s, r| {
         let lib = r["id"].clone();
         let Ok(got) = no_panic(s.execute("library.get", &json!({"library": lib}))) else { return };
         let _ = no_panic(s.execute("select.all", &json!({})));
-        for (list, kind, key) in
-            [("graphics", "graphic", "id"), ("colors", "fillColor", "name"), ("charStyles", "charStyle", "name"), ("paraStyles", "paraStyle", "name")]
-        {
+        for (list, kind, key) in [
+            ("graphics", "graphic", "id"),
+            ("colors", "fillColor", "name"),
+            ("gradients", "fillGradient", "name"),
+            ("patterns", "fillPattern", "name"),
+            ("charStyles", "charStyle", "name"),
+            ("paraStyles", "paraStyle", "name"),
+        ] {
             if let Some(item) = got[list].get(0) {
                 let _ = no_panic(s.execute("library.use", &json!({"library": lib, "kind": kind, "item": item[key]})));
                 let to = json!({"library": lib, "kind": kind, "item": item[key], "group": got["groups"][0]["name"]});
@@ -1136,6 +1174,11 @@ fn libraries(what: &str, data: &str) -> Result<(), TestCaseError> {
                 }
             }
         }
+        // Added where the panel drops it: into the first group, next to the first colour and graphic.
+        let group = &got["groups"][0]["name"];
+        let to = json!({"library": lib, "kind": "fillColor", "color": "#123456", "group": group, "after": got["colors"][0]["name"]});
+        let _ = no_panic(s.execute("library.add", &to));
+        let _ = no_panic(s.execute("library.add", &json!({"library": lib, "kind": "graphic", "group": group, "before": got["graphics"][0]["id"]})));
         if let Some(g) = got["groups"].get(0) {
             for to in [0, 1, 1_000_000] {
                 let _ = no_panic(s.execute("library.moveGroup", &json!({"library": lib, "group": g["name"], "to": to})));
@@ -1146,8 +1189,8 @@ fn libraries(what: &str, data: &str) -> Result<(), TestCaseError> {
     })
 }
 
-/// A Libraries panel library of the rich document's first object (a graphic), a colour, its
-/// type's character and paragraph styles and a group, exported, made once.
+/// A Libraries panel library of the rich document's first object (a graphic) and its gradient, a
+/// colour, a pattern, its type's character and paragraph styles and a group, exported, made once.
 fn saved_library() -> String {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
@@ -1156,6 +1199,11 @@ fn saved_library() -> String {
         let first = s.doc().unwrap().doc.layers[0].children().unwrap()[0].id.0;
         let g = s.execute("library.add", &json!({"kind": "graphic", "ids": [first]})).unwrap()["id"].clone();
         s.execute("library.add", &json!({"kind": "fillColor", "color": "#336699"})).unwrap();
+        s.execute("library.add", &json!({"kind": "fillGradient", "ids": [first]})).unwrap();
+        s.execute("select.set", &json!({"ids": [first]})).unwrap();
+        s.execute("object.pattern.make", &json!({"name": "Tiles", "width": 200, "height": 150})).unwrap();
+        s.execute("object.pattern.done", &json!({})).unwrap();
+        s.execute("library.add", &json!({"kind": "fillPattern", "swatch": "Tiles"})).unwrap();
         s.execute("select.all", &json!({})).unwrap();
         for kind in ["charStyle", "paraStyle"] {
             s.execute("library.add", &json!({"kind": kind})).unwrap();
@@ -1671,6 +1719,60 @@ proptest! {
             let p = json!({"name": name, "dataBase64": vectorcraft_format::base64_encode(&bytes), "thumbnail": 8});
             let _ = no_panic(s.execute("file.place.info", &p));
             let _ = no_panic(s.execute("file.place", &p));
+            let _ = no_panic(s.execute("clipboard.importImage", &json!({"dataBase64": vectorcraft_format::base64_encode(&bytes)})));
+        });
+        prop_assert!(r.is_ok(), "{name}: panicked: {:?}", r.err());
+    }
+}
+
+/// PCX files of each layout, 3 × 2 pixels at 150 dpi: 1 bit in two colors, 1 bit in four planes,
+/// 2 bits with CGA palette settings, 4 bits with the header palette, 8 bits with the 256-color palette after the image data,
+/// and 24 bits in three planes, with runs that cross a scan line.
+fn pcx_samples() -> Vec<(&'static str, Vec<u8>)> {
+    let pcx = |bits: u8, planes: u8, line: u16, data: &[u8]| {
+        let mut f = vec![0x0a, 5, 1, bits, 0, 0, 0, 0, 2, 0, 1, 0, 150, 0, 150, 0];
+        f.extend((0..48u8).map(|i| i.wrapping_mul(37)));
+        f.extend([0, planes]);
+        f.extend(line.to_le_bytes());
+        f.extend(1u16.to_le_bytes());
+        f.resize(128, 0);
+        f.extend(data);
+        f
+    };
+    let mut paletted = pcx(8, 1, 4, &[0xc5, 7, 0xc1, 0xff, 1, 2]);
+    paletted.push(0x0c);
+    paletted.extend((0..=255u8).flat_map(|i| [i, 255 - i, i / 2]));
+    vec![
+        ("a.pcx", pcx(1, 1, 2, &[0xa0, 0, 0x40, 0])),
+        ("b.pcx", pcx(1, 4, 2, &[0xc8, 0xe0, 0x20, 0, 0x60, 0, 0xc4, 0x80])),
+        ("c.pcx", pcx(2, 1, 2, &[0x1b, 0, 0xc2, 0xe4])),
+        ("d.pcx", pcx(4, 1, 2, &[0xf1, 0x70, 0x23, 0x40])),
+        ("e.pcx", paletted),
+        ("f.pcx", pcx(8, 3, 4, &[0xc9, 200, 0xcf, 40])),
+    ]
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Mutated PCX files (header fields, run-length bytes and the palette after the image data)
+    /// never crash placing, opening or pasting them.
+    #[test]
+    fn mutated_pcx_files_place_without_panics(which in 0usize..6, cut in 0usize..960, edits in prop::collection::vec((0usize..960, any::<u8>()), 0..12)) {
+        let (name, mut bytes) = pcx_samples().swap_remove(which);
+        for (at, b) in edits {
+            if let Some(x) = bytes.get_mut(at) {
+                *x = b;
+            }
+        }
+        bytes.truncate(cut.max(4));
+        let r = catch_quiet(|| {
+            let mut s = vectorcraft_engine::Session::new();
+            s.execute("file.new", &json!({"width": 100, "height": 100})).unwrap();
+            let p = json!({"name": name, "dataBase64": vectorcraft_format::base64_encode(&bytes), "thumbnail": 8});
+            let _ = no_panic(s.execute("file.place.info", &p));
+            let _ = no_panic(s.execute("file.place", &p));
+            let _ = no_panic(s.execute("document.open", &json!({"name": name, "dataBase64": vectorcraft_format::base64_encode(&bytes)})));
             let _ = no_panic(s.execute("clipboard.importImage", &json!({"dataBase64": vectorcraft_format::base64_encode(&bytes)})));
         });
         prop_assert!(r.is_ok(), "{name}: panicked: {:?}", r.err());
@@ -2495,6 +2597,13 @@ fn ascii85(data: &[u8]) -> String {
 /// A pattern's definition in editing data: its name and tile, its art on `%_` lines, its end.
 const PATTERN: &str = "%AI3_BeginPattern: (Dots)\n(Dots) 0 0 6 6\n%_0 A\n%_0 Ae\n%_u\n%_0 0 m\n%_0 6 L\n%_6 6 L\n%_6 0 L\n%_n\n%_0 0 0 1 K\n%_1 J 1 w\n%_3 3 m\n%_3 3 L\n%_S\n%_U\n%_9 () XW\nE\n%AI3_EndPattern\n";
 
+/// The swatches in editing data: process, spot (one the art doesn't use), global, a gradient that
+/// isn't defined and a pattern, a colour group, and versioned content read once.
+const PALETTE: &str = "%AI5_BeginPalette\n0 0 Pb\n%AI17_Begin_Content_if_version_gt:24 15\n1 1 1 1 ([Registration]) 0 Xs\n([Registration])\nPc\n\
+     0 0 0 1 k\n(Black)\nPc\n0.1 0.9 0.8 0 (Unused ink) 0 x\n(Unused ink)\nPc\n0 0 0 1 0 0 0 (Black global) 0 1 Xk\n(Black global)\nPc\n\
+     Bb\n2 (G) 0 0 0 1 1 0 0 1 0 0 1 Bg\n0 BB\n(G)\nPc\n(Dots) 0 0 1 1 0 0 0 0 0 [1 0 0 1 0 0] p\n(Dots)\nPc\n\
+     %AI17_Alternate_Content\n0 0 0 1 k\n(Black)\nPc\n%AI17_End_Versioned_Content\n1 (Greys) 1 Pg\n0 0 0 0.5 k\n(K50)\nPc\nPB\n%AI5_EndPalette\n";
+
 /// The editing data of a file with every sort of object the layers reader knows, and some it doesn't.
 fn editing_text() -> String {
     let square = |x: u32| format!("0 0 1 0 k\n{x} 10 m\n{} 10 L\n{} 14 L\n{x} 14 L\nf", x + 4, x + 4);
@@ -2520,6 +2629,7 @@ fn editing_text() -> String {
         "Bb\n1 (G) 0 0 0 1 1 0 0 1 0 0 1 Bg\n1 0 0 1 0 0 Xm\n0 0 0 0 0 0 Bm\n1 0 0 1 5 5 Bm\n0 BB".into(),
         "0 1 w 2 J 0 j 4 M [3 2]0 d 1 D".into(),
         "0 0 0 1 (Black global) 0.4 0 Xk".into(),
+        "0 0 0 0 0 0 0 ([Registration]) 0.1 1 Xz".into(),
         "(Dots) 0 0 1 1 0 0 0 0 0 [1 0 0 1 0 0] p".into(),
         square(60),
         // A 2 × 1 CMYK image with an alpha channel, its samples in hex.
@@ -2532,7 +2642,7 @@ fn editing_text() -> String {
         format!("%AI5_BeginLayer\n{visible} 1 1 1 0 0 1 0 79 128 255 0 50 0 Lb\n({name}) Ln\n{body}\nLB\n%AI5_EndLayer--\n")
     };
     format!(
-        "%!PS-Adobe-3.0 \n%%BoundingBox: 0 0 100 100\n%%HiResBoundingBox: 0 0 100 100\n%AI3_Cropmarks: 0 0 100 100\n{PATTERN}{}{}%%Trailer\n",
+        "%!PS-Adobe-3.0 \n%%BoundingBox: 0 0 100 100\n%%HiResBoundingBox: 0 0 100 100\n%AI3_Cropmarks: 0 0 100 100\n{PATTERN}{PALETTE}{}{}%%Trailer\n",
         layer("One", 1, &format!("{body}\n{}", layer("Sub", 1, &square(70)))),
         layer("Two", 0, &square(80))
     )
@@ -2550,6 +2660,20 @@ fn editing_eps(editing: &str) -> Vec<u8> {
         lines.join("\n")
     )
     .into_bytes()
+}
+
+/// The fuzzed editing data, as it is, opens with its palette's swatches in its order and groups,
+/// the spot colour the art doesn't use included (the gradient isn't defined: left out).
+#[test]
+fn the_editing_fixture_reads_its_palette() {
+    let private = [b"%AI24_ZStandard_Data".as_slice(), &zstd(&editing_text())].concat();
+    let (doc, warnings, layers) = vectorcraft_eps::layered_ai(&private, Document::new(100.0, 100.0), vec![], false, true, 1.0);
+    assert!(layers, "{warnings:?}");
+    let swatches: Vec<&str> = doc.swatches.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(swatches, ["[None]", "Black", "Unused ink", "Black global", "Dots"]);
+    assert!(doc.swatch("Unused ink").is_some_and(|s| s.spot && s.global));
+    let groups: Vec<(&str, usize)> = doc.swatch_groups.iter().map(|g| (g.name.as_str(), g.swatches.len())).collect();
+    assert_eq!(groups, [("Greys", 1)]);
 }
 
 /// The fuzzed editing data, as it is, reads its CMYK image with its ink amounts and its alpha
@@ -2943,6 +3067,17 @@ fn arb_ai_token() -> impl Strategy<Value = String> {
             "[1 0 0 1 0 0 10 10 12 10 1 8 10 1] /N X#",
             "[1e308 -1e308 0] /N X#",
             "0 /E X#",
+            "[2 2] /Size X#",
+            "/Cartesian /Type X#",
+            "[1 1] /P X#",
+            "(Adobe Path Blends) 1 0 92 XP",
+            "(Adobe Path Blends) 1 0 999999 XP",
+            "\n%44434241010000000000000000000000\n",
+            "\n%0200000041000000000000000000000000000000\n",
+            "\n%4G\n",
+            "%_/ArtDictionary :\n%_(A) /String (ShapeBlendPathID) ,\n%_(K) /String (ShapeBlendPathType) ,\n%_;\n",
+            "%_/ArtDictionary :\n%_(S) /String (ShapeBlendPathType) ,\n%_;\n",
+            "9 () XW",
             "\n%AI9_BeginArtStyles\n",
             "\n%AI9_EndArtStyles\n",
             "/KnownStyle :",
@@ -3353,17 +3488,38 @@ fn deeply_nested_svg_is_refused_or_merged() {
             "<svg {SVG_NS} width=\"9\" height=\"9\"><defs>{links}<rect id=\"u3000\" width=\"1\" height=\"1\"/></defs><use href=\"#u0\"/></svg>"
         );
         assert!(open_deep("chain.svg", chain.as_bytes()).is_none());
+        // SVG images in SVG images, read on the same stack: each too deep, of a type that is read
+        // as SVG too (`text/plain`), or each within the cap but not all together (#3562). What is
+        // past the cap is left out.
+        let images = [nested_images(3, 1000), nested_images(12, most - 4)];
+        for (i, file) in images.iter().enumerate() {
+            let (_, warnings) = open_deep("images.svg", file.as_bytes()).expect("opens");
+            assert!(warnings.iter().any(|w| w.contains("SVG images were left out")), "{i}: {warnings:?}");
+        }
         // Placed and pasted, as opened.
         let mut s = vectorcraft_engine::Session::new();
         s.execute("file.new", &json!({"width": 300, "height": 200})).unwrap();
-        for n in [40, 2 * most] {
-            let p = json!({"name": "deep.svg", "dataBase64": vectorcraft_format::base64_encode(nested_svg(n).as_bytes())});
+        for svg in [nested_svg(40), nested_svg(2 * most)].iter().chain(&images) {
+            let p = json!({"name": "deep.svg", "dataBase64": vectorcraft_format::base64_encode(svg.as_bytes())});
             let _ = no_panic(s.execute("file.place", &p));
-            let _ = no_panic(s.execute("clipboard.importSvg", &json!({"svg": nested_svg(n)})));
+            let _ = no_panic(s.execute("clipboard.importSvg", &json!({"svg": svg})));
             let _ = no_panic(s.execute("edit.paste", &json!({})));
             assert!(!s.doc().unwrap().doc.too_deep(None));
         }
     });
+}
+
+/// An SVG showing a chain of `levels` SVG images from `text/plain` data URLs, each `n` groups
+/// deep around the next.
+fn nested_images(levels: usize, n: usize) -> String {
+    let image = |svg: &str| {
+        format!("<image href=\"data:text/plain;base64,{}\" width=\"9\" height=\"9\"/>", vectorcraft_format::base64_encode(svg.as_bytes()))
+    };
+    let mut svg = nested_svg(0);
+    for _ in 0..levels {
+        svg = format!("<svg {SVG_NS} width=\"9\" height=\"9\">{}{}{}</svg>", "<g>".repeat(n), image(&svg), "</g>".repeat(n));
+    }
+    format!("<svg {SVG_NS} width=\"9\" height=\"9\">{}</svg>", image(&svg))
 }
 
 /// A page whose content is `content`, with `resources`.
@@ -3672,24 +3828,52 @@ fn pdf_streams_the_reader_would_fail_on_are_refused() {
     };
     let spaces = calculator(&spaces_past_the_cap(), "");
     let program = deflated(b"{ dup 1 exch sub 0 }");
+    // The message names the stream, so a report of a file that can't be shared says which (#4366).
+    let (parameters, cap) = ("has decode parameters that can't be applied", "would decode to more than 256 MB");
     let files = [
-        ("a form with Columns 0", form(zero, "0 0 5 5 re f")),
-        ("a form with a huge Columns", form(huge, "0 0 5 5 re f")),
-        ("an inline image with Columns 0", deep_pdf(&inline("<< /Predictor 2 /Columns 0 >>"), "<< >>")),
-        ("an inline image with a huge Columns", deep_pdf(&inline("<< /Predictor 15 /Columns 99999999999 >>"), "<< >>")),
-        ("an inline image in a compressed form", form("", &inline("<< /Predictor 2 /Columns 0 >>"))),
-        ("an object stream with Columns 0", pdf_with_object_stream("[0 0 100 100]", zero)),
-        ("a form of spaces past the cap", pdf_with("/F Do", "<< /XObject << /F 5 0 R >> >>", &[packed_as_is(FORM, &spaces_past_the_cap())])),
-        ("a function of spaces past the cap in an array", held(format!("[{spaces}]"))),
-        ("a function of spaces past the cap in a dictionary", held(format!("<< /K {spaces} >>"))),
-        ("a function of spaces past the cap in a shading", shaded(&spaces)),
-        ("a function with Columns 0 in an array", held(format!("[{}]", calculator(&program, "/DecodeParms [null << /Predictor 2 /Columns 0 >>]")))),
+        ("a form with Columns 0", form(zero, "0 0 5 5 re f"), format!("a form in it (object 5) {parameters}")),
+        ("a form with a huge Columns", form(huge, "0 0 5 5 re f"), format!("a form in it (object 5) {parameters}")),
+        (
+            "an inline image with Columns 0",
+            deep_pdf(&inline("<< /Predictor 2 /Columns 0 >>"), "<< >>"),
+            format!("an inline image in the content of object 4 {parameters}"),
+        ),
+        (
+            "an inline image with a huge Columns",
+            deep_pdf(&inline("<< /Predictor 15 /Columns 99999999999 >>"), "<< >>"),
+            format!("an inline image in the content of object 4 {parameters}"),
+        ),
+        (
+            "an inline image in a compressed form",
+            form("", &inline("<< /Predictor 2 /Columns 0 >>")),
+            format!("an inline image in the content of object 5 {parameters}"),
+        ),
+        // Read as the file opens, before its objects can be looked at one by one.
+        (
+            "an object stream with Columns 0",
+            pdf_with_object_stream("[0 0 100 100]", zero),
+            format!("a stream in it {cap}, or its decode parameters can't be applied"),
+        ),
+        (
+            "a form of spaces past the cap",
+            pdf_with("/F Do", "<< /XObject << /F 5 0 R >> >>", &[packed_as_is(FORM, &spaces_past_the_cap())]),
+            format!("a form in it (object 5) {cap}"),
+        ),
+        // A function written inside object 5 goes by it.
+        ("a function of spaces past the cap in an array", held(format!("[{spaces}]")), format!("a stream in it (object 5) {cap}")),
+        ("a function of spaces past the cap in a dictionary", held(format!("<< /K {spaces} >>")), format!("a stream in it (object 5) {cap}")),
+        ("a function of spaces past the cap in a shading", shaded(&spaces), format!("a stream in it (object 5) {cap}")),
+        (
+            "a function with Columns 0 in an array",
+            held(format!("[{}]", calculator(&program, "/DecodeParms [null << /Predictor 2 /Columns 0 >>]"))),
+            format!("a stream in it (object 5) {parameters}"),
+        ),
     ];
     on_a_small_stack(move || {
-        for (what, bytes) in &files {
+        for (what, bytes, why) in &files {
             for name in ["hostile.pdf", "hostile.ai"] {
                 let e = vectorcraft_engine::cmd::fileio::load(name, bytes).err().map(|e| e.to_string());
-                assert!(e.as_deref().is_some_and(|e| e.contains("would decode to more than 256 MB")), "{what} as {name}: {e:?}");
+                assert!(e.as_deref().is_some_and(|e| e.contains(why.as_str())), "{what} as {name}: {e:?}");
             }
         }
     });
@@ -3699,6 +3883,112 @@ fn pdf_streams_the_reader_would_fail_on_are_refused() {
     for bytes in [form(fine, "0 0 5 5 re f"), deep_pdf(&inline("<< /Predictor 1 >>"), "<< >>"), held(format!("[{function}]")), shaded(&function)] {
         vectorcraft_engine::cmd::fileio::load("fine.pdf", &bytes).expect("opens");
     }
+}
+
+/// A page drawing a thousand times one form that decodes to 64 MiB (of spaces, then a square):
+/// each drawing reads the form again, so the import stops at the page's form content instead of
+/// decoding 64 GB (#3569, which hung).
+#[test]
+fn pdf_a_huge_form_drawn_over_and_over_is_refused_in_bounded_time() {
+    use std::io::Write as _;
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    for _ in 0..64 {
+        e.write_all(&[b' '; 1 << 20]).unwrap();
+    }
+    e.write_all(b"0 0 5 5 re f").unwrap();
+    let form = packed_as_is(FORM, &e.finish().unwrap());
+    let bytes = pdf_with(&"/F Do ".repeat(1000), "<< /XObject << /F 5 0 R >> >>", &[form]);
+    let start = std::time::Instant::now();
+    let e = vectorcraft_engine::cmd::fileio::load("repeated.pdf", &bytes).err().map(|e| e.to_string());
+    let took = start.elapsed();
+    assert!(e.as_deref().is_some_and(|e| e.contains("no document was imported")), "{e:?}");
+    assert!(took < std::time::Duration::from_secs(60), "took {took:?}");
+}
+
+// A large file the reader would fail on says which stream (#4366): an image with its size in
+// pixels, a page's content, or the editing data an `.ai` keeps in its first page's `PieceInfo`.
+#[test]
+fn a_stream_past_the_cap_is_named() {
+    let image = "/Type /XObject /Subtype /Image /Width 10 /Height 10 /ColorSpace /DeviceRGB /BitsPerComponent 8";
+    let page = |contents: &str, entries: &str| {
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents {contents} /Resources << /XObject << /Im 5 0 R >> >> {entries} >>")
+            .into_bytes()
+    };
+    let plain = |content: &str| format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len() + 1).into_bytes();
+    let pdf = |page: Vec<u8>, more: Vec<Vec<u8>>| {
+        let head = [b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(), page];
+        pdf_of(&head.into_iter().chain(more).collect::<Vec<_>>())
+    };
+    let spaces = spaces_past_the_cap();
+    let editing = "/PieceInfo << /Illustrator << /Private << /AIPrivateData1 6 0 R /NumBlock 1 >> >> >>";
+    let files = [
+        (
+            "an image",
+            pdf(page("4 0 R", ""), vec![plain("q 10 0 0 10 0 0 cm /Im Do Q"), packed_as_is(image, &spaces)]),
+            "an image of 10 × 10 px in it (object 5) would decode to more than 256 MB",
+        ),
+        (
+            "a page's content",
+            pdf(page("4 0 R", ""), vec![packed_as_is("", &spaces), packed(image, "\0\0\0")]),
+            "a page's content in it (object 4) would decode to more than 256 MB",
+        ),
+        (
+            "a page's content in an array",
+            pdf(page("[4 0 R]", ""), vec![packed_as_is("", &spaces), packed(image, "\0\0\0")]),
+            "a page's content in it (object 4) would decode to more than 256 MB",
+        ),
+        (
+            "a page's content in an array of its own",
+            pdf(page("6 0 R", ""), vec![packed_as_is("", &spaces), packed(image, "\0\0\0"), b"[4 0 R]".to_vec()]),
+            "a page's content in it (object 4) would decode to more than 256 MB",
+        ),
+        (
+            "the editing data",
+            pdf(page("4 0 R", editing), vec![plain("0 0 5 5 re f"), packed(image, "\0\0\0"), packed_as_is("", &spaces)]),
+            "its editing data (object 6) would decode to more than 256 MB",
+        ),
+    ];
+    on_a_small_stack(move || {
+        for (what, bytes, why) in &files {
+            for name in ["large.pdf", "large.ai"] {
+                let e = vectorcraft_engine::cmd::fileio::load(name, bytes).err().map(|e| e.to_string());
+                assert!(e.as_deref().is_some_and(|e| e.contains(why)), "{what} as {name}: {e:?}");
+            }
+        }
+    });
+}
+
+// Pages that share one `Contents` array, the array an object of its own: its stream is named as
+// a page's content, and a refused stream elsewhere is still found past the pages (#4612 review).
+#[test]
+fn pages_sharing_a_contents_array_name_its_stream() {
+    let image = "/Type /XObject /Subtype /Image /Width 10 /Height 10 /ColorSpace /DeviceRGB /BitsPerComponent 8";
+    let plain = |content: &str| format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len() + 1).into_bytes();
+    let spaces = spaces_past_the_cap();
+    // 1 catalog, 2 pages, 3 the shared array, 4 its stream, 5 to 7 the pages, 8 an image they draw.
+    let pdf = |content: Vec<u8>, image: Vec<u8>| {
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 3 0 R /Resources << /XObject << /Im 8 0 R >> >> >>";
+        let head = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [5 0 R 6 0 R 7 0 R] /Count 3 >>".to_vec(),
+            b"[4 0 R]".to_vec(),
+            content,
+        ];
+        pdf_of(&head.into_iter().chain([page.to_vec(), page.to_vec(), page.to_vec(), image]).collect::<Vec<_>>())
+    };
+    let files = [
+        (pdf(packed_as_is("", &spaces), packed(image, "\0\0\0")), "a page's content in it (object 4) would decode to more than 256 MB"),
+        (
+            pdf(plain("q 10 0 0 10 0 0 cm /Im Do Q"), packed_as_is(image, &spaces)),
+            "an image of 10 × 10 px in it (object 8) would decode to more than 256 MB",
+        ),
+    ];
+    on_a_small_stack(move || {
+        for (bytes, why) in &files {
+            let e = vectorcraft_engine::cmd::fileio::load("shared.pdf", bytes).err().map(|e| e.to_string());
+            assert!(e.as_deref().is_some_and(|e| e.contains(why)), "{why}: {e:?}");
+        }
+    });
 }
 
 #[test]
@@ -4184,4 +4474,81 @@ fn a_long_thin_shape_with_a_shadow_renders_and_exports() {
     let bytes = affinity_sample_file(&stream, None);
     let doc = vectorcraft_engine::cmd::fileio::load("long.af", &bytes).unwrap().doc;
     survive("long shape", || Some(doc)).unwrap();
+}
+
+/// A blend in `.ai` editing data, written by hand: two keys (10 pt squares, red on the left, blue on
+/// the right) on a straight spine, `steps` steps drawn between them as the blend lays them out, and
+/// the record (`DCBA`, version 1, two keys `A` and `B`, see `vectorcraft_eps`' AI blend reader).
+fn blend_text(steps: usize) -> String {
+    use std::fmt::Write;
+    let square = |x: f64, hidden: bool, t: f64| {
+        let p = if hidden { "%_" } else { "" };
+        format!("{p}0 0 0 0 {} 0 {} Xa\n{p}{x} 40 m\n{p}{x} 50 L\n{p}{} 50 L\n{p}{} 40 L\n{p}f\n", 1.0 - t, t, x + 10.0, x + 10.0)
+    };
+    let part = |kind: &str, id: Option<&str>| {
+        let id = id.map(|i| format!("%_({i}) /String (ShapeBlendPathID) ,\n")).unwrap_or_default();
+        format!("%_/ArtDictionary :\n{id}%_({kind}) /String (ShapeBlendPathType) ,\n%_;\n")
+    };
+    let span = 10.0 * (steps as f64 + 1.0);
+    let mut s = String::from("%_0 Ae\n%_u\n");
+    s += &square(0.0, true, 0.0);
+    s += &part("K", Some("A"));
+    s += &square(span, true, 1.0);
+    s += &part("K", Some("B"));
+    let _ = write!(s, "%_5 45 m\n%_{} 45 L\n%_N\n", span + 5.0);
+    s += &part("S", None);
+    s += "%_U\n%_9 () XW\nu\n";
+    for i in 0..steps + 2 {
+        let t = i as f64 / (steps as f64 + 1.0);
+        s += &square(t * span, false, t);
+    }
+    s += "U\n9 () XW\n0 Ae\n";
+    let mut words: Vec<u32> = vec![u32::from_le_bytes(*b"DCBA"), 1, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    for id in ['A', 'B'] {
+        words.extend([id as u32, 0, 0, 0, 0, 0]);
+    }
+    let hex: String = words.iter().flat_map(|w| w.to_le_bytes()).map(|b| format!("{b:02X}")).collect();
+    let _ = write!(s, "(Adobe Path Blends) 1 0 {} XP\n%{hex}\n", hex.len() / 2);
+    s
+}
+
+/// `.ai` editing data holding `layer_art` on one layer, compressed as the private data is.
+fn ai_private(layer_art: &str) -> Vec<u8> {
+    use vectorcraft_testkit::ai;
+    let data = ai::editing_data(4000.0, 200.0, &ai::layer("L", layer_art));
+    [b"%AI24_ZStandard_Data".as_slice(), &zstd(&data)].concat()
+}
+
+/// A blend of many steps doesn't stall the import: one within the limits (a thousand steps between
+/// two keys) is checked and made live quickly, one past them keeps its drawn steps without being
+/// laid out.
+#[test]
+fn large_ai_blends_import_in_bounded_time() {
+    for (steps, live) in [(3, true), (998, true), (1_500, false)] {
+        let private = ai_private(&blend_text(steps));
+        let started = std::time::Instant::now();
+        let (doc, notes, read) = vectorcraft_eps::layered_ai(&private, Document::new(4000.0, 200.0), vec![], false, true, 1.0);
+        assert!(read, "{steps} steps: read from the layers ({notes:?})");
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(30), "{steps} steps took {took:?}");
+        let mut blends = 0;
+        doc.walk(|n| blends += usize::from(matches!(n.kind, vectorcraft_doc::NodeKind::Blend { .. })));
+        assert_eq!(blends == 1, live, "{steps} steps: live {live}");
+    }
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// A `.ai` blend whose record, parts or drawn steps are damaged or hostile: read live, as its
+    /// drawn steps, or not at all, never panicking.
+    #[test]
+    fn ai_blend_never_panics(steps in 1usize..6, cut in 0usize..2_500, edits in prop::collection::vec((0usize..2_500, prop::sample::select(vec!['0', '9', '-', '.', ' ', '\n', '(', ')', '/', ':', ';', '%', '_', 'K', 'S', 'A', 'B', 'u', 'U', 'F', 'X'])), 0..12)) {
+        let text = mutate_text(&blend_text(steps), cut, &edits);
+        let private = ai_private(&text);
+        // Far-out coordinates: the check's grid saturates instead of overflowing.
+        let far = ai_private(&blend_text(steps).replace(" 40 m\n", " 1e300 m\n").replace(" 50 L\n", " -1e300 L\n"));
+        survive("a .ai blend far out", || Some(vectorcraft_eps::layered_ai(&far, Document::new(100.0, 100.0), vec![], false, true, 1.0).0))?;
+        survive("mutated .ai blend", || Some(vectorcraft_eps::layered_ai(&private, Document::new(100.0, 100.0), vec![], false, true, 1.0).0))?;
+    }
 }

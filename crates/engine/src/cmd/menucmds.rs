@@ -13,8 +13,11 @@ use vectorcraft_geom::{Affine, Anchor, PathData, Point, Rect, Vec2};
 use vectorcraft_render::AntiAlias;
 use vectorcraft_render::encode::{RasterExportOptions, RasterFormat};
 
-use super::edit::{duplicate_in, selected_roots};
-use super::*;
+use super::edit::{duplicate_in, selected_roots, selected_roots_to_transform};
+use super::{
+    CommandSpec, EngineError, Result, Session, bad, check_numbers, check_switches, cmd, f64_or, fileio, find_command, has_doc, has_selection,
+    has_selection_outside_isolation, switch_or,
+};
 
 /// Session-level (not saved) state owned by the menu commands.
 #[derive(Clone, Debug, Default)]
@@ -41,7 +44,7 @@ pub fn specs() -> Vec<CommandSpec> {
             ["Object", "Lock"],
             None,
             "{} lock objects in the same layer that are above and overlap the selection, deselecting every selected object left locked or hidden (the key object too) → {count}",
-            has_selection,
+            has_selection_outside_isolation,
             |s, _| above(s, true)
         ),
         cmd!(
@@ -50,8 +53,17 @@ pub fn specs() -> Vec<CommandSpec> {
             ["Object", "Lock"],
             None,
             "{} lock every layer that holds no selected object → {count}",
-            has_selection,
+            has_selection_outside_isolation,
             |s, _| other_layers(s, true)
+        ),
+        cmd!(
+            "object.lock.unselected",
+            "Unselected Artwork",
+            ["Object", "Lock"],
+            Some("Cmd+Alt+Shift+2"),
+            "{} lock unselected artwork in one undo step, including unselected members of partly selected groups, clipping groups and compound paths, and guides while Lock Guides is on; hidden art and art on locked layers stay unlocked; a selected layer's art counts as selected; in isolation, only art inside the isolated object is affected; object.unlockAll unlocks locked art document-wide → {count}",
+            has_selection,
+            |s, _| unselected_art(s, true)
         ),
         cmd!(
             "object.hide.above",
@@ -59,7 +71,7 @@ pub fn specs() -> Vec<CommandSpec> {
             ["Object", "Hide"],
             None,
             "{} hide objects in the same layer that are above and overlap the selection, deselecting every selected object left hidden or locked (the key object too) → {count}",
-            has_selection,
+            has_selection_outside_isolation,
             |s, _| above(s, false)
         ),
         cmd!(
@@ -68,8 +80,17 @@ pub fn specs() -> Vec<CommandSpec> {
             ["Object", "Hide"],
             None,
             "{} hide every layer that holds no selected object → {count}",
-            has_selection,
+            has_selection_outside_isolation,
             |s, _| other_layers(s, false)
+        ),
+        cmd!(
+            "object.hide.unselected",
+            "Unselected Artwork",
+            ["Object", "Hide"],
+            Some("Cmd+Alt+Shift+3"),
+            "{} hide, in one undo step, every object select.all takes that is not selected and holds no selected object; in a group that holds one it hides the other members one by one, and a clip group, compound path or other object that holds one stays as it is; the objects of a selected layer count as selected; while Lock Guides is on, guide paths count as selected and stay as they are; object.showAll shows them again; disabled in isolation mode → {count}",
+            has_selection_outside_isolation,
+            |s, _| unselected_art(s, false)
         ),
         cmd!(
             "object.transformEach",
@@ -94,7 +115,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Rasterize…",
             ["Object"],
             None,
-            "{ppi?, background?: transparent|white|black|\"#rrggbb\", antiAlias?: none|art|type (text snapped to pixels)|bool, padding?|addAround?: pt (0–1000), colorModel?: \"rgb\"|\"cmyk\"|\"grayscale\"|\"bitmap\", clippingMask?: bool (a clip group with the art's outline)} replace the selection with an embedded PNG image; each defaults to document.rasterEffectsSettings → {id (the image, or its clip group), width, height, warning?: \"an image couldn't be decoded and is missing from the picture\" (as raster exports say)}",
+            "{ppi?, background?: transparent|white|black|\"#rrggbb\", antiAlias?: none|art|type (text snapped to pixels)|bool, padding?|addAround?: pt (0–1000), colorModel?: \"rgb\"|\"cmyk\"|\"grayscale\"|\"bitmap\", clippingMask?: bool (a clip group with the art's outline)} replace the selection with an embedded PNG image; each defaults to document.rasterEffectsSettings; a frame of threaded text that is rasterized leaves its thread with the text it shows → {id (the image, or its clip group), width, height, warning?: \"an image couldn't be decoded and is missing from the picture\" (as raster exports say)}",
             has_selection,
             rasterize
         ),
@@ -171,7 +192,7 @@ fn ids_json(ids: &[NodeId]) -> Value {
 /// The whole number `p` gives for `key`, written `4` or `4.0`, or `default` when `p` gives none or null. A value that
 /// is not a number gives the [`check_numbers`] error, and a fraction or a negative number gives
 /// "`{key}` must be a whole number".
-fn whole_or(p: &Value, key: &str, default: u64, cmd: &str) -> Result<u64> {
+pub(crate) fn whole_or(p: &Value, key: &str, default: u64, cmd: &str) -> Result<u64> {
     check_numbers(p, &[key], cmd)?;
     let Some(v) = p.get(key).filter(|v| !v.is_null()) else { return Ok(default) };
     match (v.as_u64(), v.as_f64()) {
@@ -307,6 +328,70 @@ fn other_layers(s: &mut Session, lock: bool) -> Result<Value> {
         Ok(())
     })?;
     Ok(json!({ "count": n }))
+}
+
+/// Returns the objects [`super::select::walk_selectable`] visits that are not among the selected objects `roots` and
+/// hold none of them. A selected layer's objects count as selected. The walk goes into a plain group, but not a Shaper
+/// group, that holds a selected object. With `lock`, it also goes into a clip group or compound path that holds one,
+/// and includes guide paths while `guides_locked`. Without `lock`, guide paths and the objects that hold one are left
+/// out while `guides_locked`; a clip group, Shaper group, compound path and every other object that holds a selected
+/// object or such a guide are left out with their members.
+fn unselected(
+    d: &vectorcraft_doc::Document,
+    iso: Option<NodeId>,
+    selection: &[NodeId],
+    roots: &[NodeId],
+    guides_locked: bool,
+    lock: bool,
+) -> Vec<NodeId> {
+    let mut roots: HashSet<NodeId> = roots.iter().copied().collect();
+    roots.extend(selection.iter().filter_map(|id| d.node(*id)).filter(|n| n.is_layer()).flat_map(|l| l.layer_art(true)));
+    let mut kept: Vec<NodeId> = roots.iter().copied().collect();
+    if guides_locked && !lock {
+        super::select::walk_selectable(d, iso, |n| {
+            if matches!(n.kind, NodeKind::Path { guide: true, .. }) {
+                kept.push(n.id);
+            }
+            true
+        });
+    }
+    let holds: HashSet<NodeId> = d.index_paths(kept).values().filter_map(|p| d.ancestry_at(p)).flatten().collect();
+    let mut out = vec![];
+    super::select::walk_selectable(d, iso, |n| {
+        if !holds.contains(&n.id) {
+            out.push(n.id);
+            return false;
+        }
+        !roots.contains(&n.id)
+            && (matches!(n.kind, NodeKind::Group { clip: false, .. }) && n.extras().shaper.is_none()
+                || lock && (matches!(n.kind, NodeKind::Group { clip: true, .. } | NodeKind::Compound { .. })))
+    });
+    out
+}
+
+fn unselected_art(s: &mut Session, lock: bool) -> Result<Value> {
+    let roots = selected_roots_to_transform(s)?;
+    let guides_locked = s.menu.guides_locked;
+    let st = s.doc()?;
+    let ids = unselected(&st.doc, st.isolation, &st.selection.objects, &roots, guides_locked, lock);
+    // With nothing to lock (Lock) or hide (Hide), the document and its undo history stay as they are.
+    if !ids.is_empty() {
+        s.edit(if lock { "Lock" } else { "Hide" }, |d, _| {
+            // Locking and hiding move no node in the tree, so the paths found up front stay right.
+            let paths = d.index_paths(ids.iter().copied());
+            for id in &ids {
+                if let Some(n) = paths.get(id).and_then(|p| d.node_mut_at(p)) {
+                    if lock {
+                        n.locked = true;
+                    } else {
+                        n.visible = false;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(json!({ "count": ids.len() }))
 }
 
 // ---------- Transform Each ----------
@@ -469,7 +554,7 @@ impl Rasterized {
         let key = unique_key(d, "raster");
         d.images.insert(key.clone(), vectorcraft_doc::ImageBlob::new("image/png", self.png));
         let id = d.alloc_id();
-        let image = ImageObject { key, width: self.width, height: self.height, xf: self.xf, link: None, placement: Default::default() };
+        let image = ImageObject { key, width: self.width, height: self.height, xf: self.xf, link: None, placement: Default::default(), pixels: None };
         let node = Node::new(id, NodeKind::Image(Box::new(image)));
         match self.clip {
             Some((path, rule)) => super::rasterfx::clip_group(d, path, rule, node),
@@ -561,8 +646,11 @@ fn rasterize(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, "nothing selected"));
     }
     let id = s.edit("Rasterize", |d, sel| {
+        let threaded = super::threads::frames(d);
         let node = image.into_node(d);
         let id = d.wrap(&roots, |_| node)?;
+        // Rasterized frames of threaded text leave their threads with the text they show.
+        super::threads::leave_threads(d, &threaded);
         sel.set([id]);
         Ok(id)
     })?;
@@ -721,6 +809,7 @@ fn crop_image(s: &mut Session, p: &Value) -> Result<Value> {
                 xf: Affine::translate(region.origin().to_vec2()) * Affine::scale(1.0 / scale),
                 link: None,
                 placement: Default::default(),
+                pixels: None,
             }));
         }
         Ok(())
@@ -788,6 +877,7 @@ fn trim_image(s: &mut Session, id: NodeId, im: ImageObject) -> Result<Value> {
                 xf: im.xf * Affine::translate((f64::from(x0), f64::from(y0))),
                 link: None,
                 placement: Default::default(),
+                pixels: None,
             }));
         }
         Ok(())
@@ -967,14 +1057,18 @@ fn convert_to_artboards(s: &mut Session, _: &Value) -> Result<Value> {
             if b.width() <= 0.0 || b.height() <= 0.0 {
                 continue;
             }
+            // Named one past the highest artboard id the document has, whatever id it is given.
+            let number = d.artboards.iter().map(|a| a.id).max().map_or(1, |m| m.saturating_add(1));
             let aid = d.next_artboard_id();
             d.artboards.push(vectorcraft_doc::Artboard {
                 id: aid,
-                name: format!("Artboard {aid}"),
+                name: format!("Artboard {number}"),
                 rect: b,
                 locked: false,
                 show_center_mark: false,
                 show_cross_hairs: false,
+                show_video_safe_areas: false,
+                video_ruler_pixel_aspect_ratio: 1.0,
                 color: None,
             });
             converted.push(id);

@@ -139,6 +139,14 @@ fn floats(v: &Value) -> Option<Vec<f64>> {
 
 /// A colour object (`RGBA`, `HSLA`, `CMYK`, `GRAY`, `LABA`, `Pant`).
 pub(crate) fn color(r: &mut Reader, id: ObjId) -> Option<Color> {
+    color_within(r, id, 0)
+}
+
+/// The most spot colours that stand for one another followed.
+const MAX_SPOT_CHAIN: u32 = 8;
+
+/// [`color`], `depth` spot colours deep: one that stands for itself (or a ring of them) ends here.
+fn color_within(r: &mut Reader, id: ObjId, depth: u32) -> Option<Color> {
     let s = r.s;
     let class = s.class(id)?;
     let col = || -> Option<Vec<f64>> {
@@ -170,7 +178,13 @@ pub(crate) fn color(r: &mut Reader, id: ObjId) -> Option<Color> {
         }
         b"Pant" => {
             r.warn("spot colours (imported as their RGB equivalent)");
-            return s.obj(id, b"srgb").and_then(|c| color(r, c)).or_else(|| s.obj(id, b"base").and_then(|c| color(r, c)));
+            if depth >= MAX_SPOT_CHAIN {
+                return None;
+            }
+            return s
+                .obj(id, b"srgb")
+                .and_then(|c| color_within(r, c, depth + 1))
+                .or_else(|| s.obj(id, b"base").and_then(|c| color_within(r, c, depth + 1)));
         }
         b"RegC" => Color::Cmyk { c: 1.0, m: 1.0, y: 1.0, k: 1.0, a: 1.0 },
         _ => {
@@ -180,7 +194,7 @@ pub(crate) fn color(r: &mut Reader, id: ObjId) -> Option<Color> {
     })
 }
 
-fn hsl(h: f64, s: f64, l: f64) -> (f64, f64, f64) {
+pub(crate) fn hsl(h: f64, s: f64, l: f64) -> (f64, f64, f64) {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let hp = (h.rem_euclid(1.0)) * 6.0;
     let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
@@ -340,4 +354,18 @@ pub(crate) fn stroke(r: &mut Reader, pen: ObjId, ldsc: ObjId, local: Affine, beh
         r.warn("brush and pressure strokes (imported as plain strokes)");
     }
     Some(Stroke { paint, width, cap, join, miter_limit, align, dash, behind })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hsl_lightness_1_is_white_and_0_is_black() {
+        assert_eq!(hsl(0.0, 1.0, 1.0), (1.0, 1.0, 1.0));
+        assert_eq!(hsl(0.5, 1.0, 1.0), (1.0, 1.0, 1.0));
+        assert_eq!(hsl(0.0, 1.0, 0.0), (0.0, 0.0, 0.0));
+        let (r, g, b) = hsl(0.0, 1.0, 0.5);
+        assert!((r - 1.0).abs() < 1e-6 && g.abs() < 1e-6 && b.abs() < 1e-6);
+    }
 }

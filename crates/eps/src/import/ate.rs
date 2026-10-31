@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use kurbo::{BezPath, CubicBez, ParamCurve, ParamCurveArclen};
 use vectorcraft_color::{Color, Paint};
-use vectorcraft_doc::{CharStyle, Justify, Node, NodeId, NodeKind, ParaStyle, TextKind, TextObject, TextRun};
+use vectorcraft_doc::{CharStyle, Justify, Node, NodeId, NodeKind, ParaDirection, ParaStyle, TextKind, TextObject, TextRun};
 use vectorcraft_geom::{Affine, PathData, Point, Rect};
 
 /// Longest story read (bytes).
@@ -281,6 +281,8 @@ pub(super) struct Story {
     paras: Vec<(usize, Para)>,
     /// `(characters, style)` in order.
     runs: Vec<(usize, Style)>,
+    /// Type on a path: the spacing its first frame's layout implies ([`path_spacing`]).
+    path_spacing: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -296,6 +298,8 @@ struct Style {
     fill: Option<Color>,
     stroke: Option<Color>,
     stroke_width: f64,
+    /// Key 12, the case: 1 Small Caps, 2 All Caps.
+    caps: u8,
 }
 
 /// The text document of an editing copy.
@@ -373,8 +377,17 @@ impl Texts {
                 let range = carries.get("6").and_then(Val::nums).unwrap_or_default();
                 let segments = segments()?;
                 let n = segments.len() as f64;
-                let start = range.first().copied().unwrap_or(0.0).clamp(0.0, n);
-                let end = range.get(1).copied().unwrap_or(n).clamp(start, n);
+                let finite = |v: Option<&f64>| v.copied().filter(|v| v.is_finite());
+                let (start, end) = if closed(&segments) {
+                    // Round a closed path the end is written unwrapped (the start plus the run, so
+                    // past the last segment), or wrapped the other way: both brackets are places on
+                    // the loop.
+                    let start = finite(range.first()).unwrap_or(0.0).rem_euclid(n);
+                    (start, finite(range.get(1)).map_or(start, |e| e.rem_euclid(n)))
+                } else {
+                    let start = finite(range.first()).unwrap_or(0.0).clamp(0.0, n);
+                    (start, finite(range.get(1)).unwrap_or(n).clamp(start, n))
+                };
                 Some(FrameKind::OnPath { segments, start, end })
             }
             _ => None,
@@ -397,8 +410,11 @@ impl Texts {
             return None;
         }
         // The first frame's layout, when the file keeps one: where its lines start.
-        let (mut anchor, mut lines) = ((0.0, 0.0), vec![]);
+        let (mut anchor, mut lines, mut path_spacing) = ((0.0, 0.0), vec![], 0.0);
         if let Some(f) = view.get("2").and_then(|l| find_node(l, "F")) {
+            if matches!(frames.first(), Some(FrameKind::OnPath { .. })) {
+                path_spacing = self::path_spacing(f);
+            }
             if let Some(a) = f.get("0").and_then(|a| a.get("0")).and_then(Val::nums)
                 && let [x, y, ..] = a.as_slice()
             {
@@ -430,7 +446,7 @@ impl Texts {
         if runs.is_empty() {
             runs.push((text.chars().count(), self.style(None)));
         }
-        Some(Story { text, anchor, lines, frames, paras, runs })
+        Some(Story { text, anchor, lines, frames, paras, runs, path_spacing })
     }
 
     /// A paragraph's attributes: its own keys, else the document's.
@@ -467,6 +483,7 @@ impl Texts {
             fill: if on("56") { Some(pick("53").and_then(paint).unwrap_or(Color::BLACK)) } else { None },
             stroke: if matches!(pick("57"), Some(Val::Bool(true))) { pick("54").and_then(paint) } else { None },
             stroke_width: num("63").filter(|v| *v >= 0.0 && *v < 1e4).unwrap_or(1.0),
+            caps: num("12").filter(|v| *v == 1.0 || *v == 2.0).map_or(0, |v| v as u8),
         }
     }
 }
@@ -530,11 +547,16 @@ fn path_of(segments: &[[f64; 8]], template: (f64, f64), to_doc: Affine) -> PathD
         }
         bp.curve_to(at(*x1, *y1), at(*x2, *y2), at(*x3, *y3));
     }
-    let closed = matches!((segments.first(), segments.last()), (Some(f), Some(l)) if (f[0] - l[6]).abs() < 1e-3 && (f[1] - l[7]).abs() < 1e-3);
+    let closed = closed(segments);
     if closed {
         bp.close_path();
     }
     PathData::from_bezpath(&bp)
+}
+
+/// Do `segments` end where they start (a closed path)?
+fn closed(segments: &[[f64; 8]]) -> bool {
+    matches!((segments.first(), segments.last()), (Some(f), Some(l)) if (f[0] - l[6]).abs() < 1e-3 && (f[1] - l[7]).abs() < 1e-3)
 }
 
 /// Where on `segments` the place `t` (segment index and the place in it) is, as a fraction of their
@@ -553,6 +575,50 @@ fn length_fraction(segments: &[[f64; 8]], t: f64) -> f64 {
         None => 0.0,
     };
     ((before + within) / total).clamp(0.0, 1.0)
+}
+
+/// The spacing (Type on a Path Options › Spacing) that the layout `f` of type on a path implies.
+/// The file closes its glyphs up round the outside of a curve and opens them up round the inside,
+/// even where its frame keeps no spacing; the text engine spaces glyphs that way by the spacing
+/// (`vectorcraft_text`'s `path_steps`): between two glyphs' centres, the path's length `s`, their
+/// advances' mean `a` and how far it turns `t` (away from their tops) make `s + t × spacing = a`.
+/// Fitted over every pair of the layout's glyphs; none where the path doesn't turn under them.
+fn path_spacing(f: &Val) -> f64 {
+    let mut found = vec![];
+    find_nodes(f, "G", &mut found);
+    let (mut sum, mut turns) = (0.0, 0.0);
+    for g in found {
+        // Each glyph's origin, its matrix (along its baseline, then towards its foot) and where it
+        // ends along the line; the lists end with where the line ends.
+        let Some(at) = g.get("21") else { continue };
+        let list = |k: &str| at.get(k).and_then(Val::nums).unwrap_or_default();
+        let (xs, ys, matrices, ends) = (list("1"), list("2"), list("3"), list("4"));
+        let glyphs: Vec<(Point, f64, kurbo::Vec2, kurbo::Vec2)> = xs
+            .iter()
+            .zip(&ys)
+            .zip(matrices.as_chunks::<6>().0)
+            .zip(ends.windows(2))
+            .map(|(((x, y), [a, b, c, d, ..]), e)| {
+                let advance = e.get(1).zip(e.first()).map_or(0.0, |(e1, e0)| e1 - e0);
+                let along = kurbo::Vec2::new(*a, *b);
+                (Point::new(*x, *y) + along * (advance * 0.5), advance, along, kurbo::Vec2::new(*c, *d))
+            })
+            .collect();
+        for w in glyphs.windows(2) {
+            let [(p, a0, along, foot), (q, a1, next, _)] = w else { continue };
+            let turn = next.dot(*foot).atan2(next.dot(*along));
+            // The length of the arc between the centres (the path is taken to be round there). A
+            // corner (a turn of more than a radian between two glyphs) isn't round: left out.
+            let half = turn.abs() * 0.5;
+            let length = if half > 1e-9 { (*q - *p).hypot() * half / half.sin() } else { (*q - *p).hypot() };
+            if turn.abs() <= 1.0 && length.is_finite() && a0.is_finite() && a1.is_finite() {
+                sum += ((a0 + a1) * 0.5 - length) * turn;
+                turns += turn * turn;
+            }
+        }
+    }
+    let spacing = sum / turns;
+    if turns > 1e-6 && spacing.is_finite() { spacing.clamp(-1000.0, 1000.0) } else { 0.0 }
 }
 
 impl Story {
@@ -604,7 +670,7 @@ impl Story {
         let r = match self.frames.first()? {
             FrameKind::Area(s) => bounds(s)?,
             FrameKind::OnPath { segments, .. } => bounds(segments)?.inflate(size * 1.5, size * 1.5),
-            FrameKind::Point(_) => {
+            FrameKind::Point(m) => {
                 let longest = self.text.split(['\r', '\x03']).map(|l| l.chars().count()).max().unwrap_or(0) as f64;
                 let reach = longest * size + size;
                 let points: Vec<Point> = self.line_starts(template).into_iter().map(|(_, (x, y))| to_doc * Point::new(x, y)).collect();
@@ -612,7 +678,19 @@ impl Story {
                     let (x, y) = self.place(template);
                     to_doc * Point::new(x, y)
                 });
-                points.iter().fold(Rect::from_points(first, first), |r, p| r.union_pt(*p)).inflate(reach, size * 1.5)
+                // Along the baseline as far as a line reaches, across it a line and a half: turned
+                // with the type (a dimension's label turned a quarter runs down the page).
+                // (The canvas is y down, the art y up: see [`to_art`].)
+                let along = to_doc * Point::new(m[0], -m[1]) - to_doc * Point::ZERO;
+                let along = if along.hypot() > 1e-9 && along.is_finite() { along / along.hypot() } else { kurbo::Vec2::new(1.0, 0.0) };
+                let across = kurbo::Vec2::new(-along.y, along.x);
+                let mut r = Rect::from_points(first, first);
+                for p in points.iter().chain([&first]) {
+                    for (t, n) in [(-reach, -1.5), (-reach, 1.5), (reach, -1.5), (reach, 1.5)] {
+                        r = r.union_pt(*p + along * t + across * (n * size));
+                    }
+                }
+                r
             }
         };
         r.is_finite().then_some(r)
@@ -638,7 +716,9 @@ impl Story {
             FrameKind::Area(s) => (1.0, Affine::IDENTITY, TextKind::Area { frame: path_of(s, template, to_doc) }),
             FrameKind::OnPath { segments, start, end } => {
                 let n = segments.len() as f64;
-                let end = (*end < n - 0.02).then(|| length_fraction(segments, *end));
+                // A closed path keeps its end bracket wherever it is (the same place as the start: a
+                // full turn, see `TextKind::path_span`); an open one's end at its end is none.
+                let end = (closed(segments) || *end < n - 0.02).then(|| length_fraction(segments, *end));
                 (1.0, Affine::IDENTITY, TextKind::OnPath { path: path_of(segments, template, to_doc), start: length_fraction(segments, *start), end })
             }
         };
@@ -679,6 +759,9 @@ impl Story {
         t.para = paras.first().cloned().unwrap_or_default();
         if paras.len() > 1 && paras.iter().any(|p| *p != t.para) {
             t.paras = paras;
+        }
+        if matches!(kind, TextKind::OnPath { .. }) && !threaded {
+            t.path_spacing = self.path_spacing * scale;
         }
         t.kind = kind;
         t.xf = xf;
@@ -774,6 +857,9 @@ fn para_style(p: &Para, scale: f64) -> ParaStyle {
         space_before: p.space_before * scale,
         space_after: p.space_after * scale,
         hyphenate: p.hyphenate,
+        // A right-to-left paragraph lays its text out from the right whatever letters it has
+        // (" 120.5 mm " reads "mm 120.5"); without the key, from its first strong letter.
+        direction: p.rtl.then_some(ParaDirection::RightToLeft),
         ..ParaStyle::default()
     }
 }
@@ -793,6 +879,9 @@ fn char_style(s: &Style, scale: f64, leading: Option<f64>) -> CharStyle {
         fill: s.fill.map_or(Paint::None, Paint::solid),
         stroke: s.stroke.map_or(Paint::None, Paint::solid),
         stroke_width: if s.stroke.is_some() { s.stroke_width * scale } else { 0.0 },
+        all_caps: s.caps == 2,
+        // At the default Small Caps size of Document Setup: the file's own isn't read.
+        small_caps: (s.caps == 1).then(|| vectorcraft_doc::DocSetup::default().small_caps_size),
         ..CharStyle::default()
     }
 }
@@ -822,6 +911,37 @@ mod tests {
         assert_eq!(justify(b"/0 1 /33 0"), Justify::Right);
     }
 
+    /// Where point type lies runs along its baseline: a label turned a quarter (as a vertical
+    /// dimension's is) lies in a tall box, not a wide one.
+    #[test]
+    fn point_type_lies_along_its_baseline() {
+        let para =
+            Texts { stories: vec![], fonts: vec![], defaults: Val::Dict(BTreeMap::new()), para_defaults: Val::Dict(BTreeMap::new()), frames: vec![] }
+                .para(None);
+        let mut s = story(" 80 mm ", &[0.0], &para);
+        let size = |s: &Story| s.region((0.0, 0.0), Affine::IDENTITY).map(|r| (r.width(), r.height())).unwrap();
+        let (w, h) = size(&s);
+        assert!(w > 3.0 * h, "level: {w} × {h}");
+        // Turned −90° on the canvas (y down): the baseline runs down the page.
+        s.frames = vec![FrameKind::Point([0.0, 1.0, -1.0, 0.0, 0.0, 0.0])];
+        let (w, h) = size(&s);
+        assert!(h > 3.0 * w, "turned: {w} × {h}");
+    }
+
+    /// A right-to-left paragraph is laid out right to left even when it has no right-to-left
+    /// letters (a dimension's label " 120.5 mm " reads "mm 120.5"); a left-to-right one, or one
+    /// that doesn't say, goes by its letters.
+    #[test]
+    fn right_to_left_paragraphs_set_their_direction() {
+        let texts =
+            Texts { stories: vec![], fonts: vec![], defaults: Val::Dict(BTreeMap::new()), para_defaults: read(b"/33 1").unwrap(), frames: vec![] };
+        let direction = |own: &[u8]| para_style(&texts.para(Some(&read(own).unwrap())), 1.0).direction;
+        assert_eq!(direction(b"/0 2"), Some(ParaDirection::RightToLeft), "from the document's defaults");
+        assert_eq!(direction(b"/0 2 /33 0"), None, "the paragraph's own");
+        let plain = Texts { para_defaults: Val::Dict(BTreeMap::new()), ..texts };
+        assert_eq!(para_style(&plain.para(None), 1.0).direction, None);
+    }
+
     #[test]
     fn values_read_nested_dictionaries_lists_and_utf16_strings() {
         let v = read(b" /1 << /0 [ 1 2.5 -3 ] /2 (\xfe\xff\x00h\x00i) /3 true /99 /Name >> /0 (a\\)b\\n)").unwrap();
@@ -840,6 +960,84 @@ mod tests {
         }
         let deep = format!("/0 {}", "[".repeat(200));
         assert!(read(deep.as_bytes()).is_none());
+    }
+
+    /// A text document's frame on a path of `segments` (each `x0 y0 x1 y1 x2 y2 x3 y3`) with the
+    /// range `range`, written by hand.
+    fn on_path_frame(segments: &[[f64; 8]], range: [f64; 2]) -> Option<FrameKind> {
+        let nums = |v: &[f64]| v.iter().map(|n| format!("{n}")).collect::<Vec<_>>().join(" ");
+        let all: Vec<f64> = segments.iter().flatten().copied().collect();
+        let doc = format!("/0 << /1 << /0 [ {} ] >> /2 << /0 2 /6 [ {} ] >> >>", nums(&all), nums(&range));
+        let texts = Texts {
+            stories: vec![],
+            fonts: vec![],
+            defaults: Val::Dict(BTreeMap::new()),
+            para_defaults: Val::Dict(BTreeMap::new()),
+            frames: vec![read(doc.as_bytes()).unwrap()],
+        };
+        texts.frame(0)
+    }
+
+    /// A circle of radius 100 round the origin in four cubics, from its right, closed.
+    fn circle() -> Vec<[f64; 8]> {
+        let k = 55.228475;
+        vec![
+            [100.0, 0.0, 100.0, k, k, 100.0, 0.0, 100.0],
+            [0.0, 100.0, -k, 100.0, -100.0, k, -100.0, 0.0],
+            [-100.0, 0.0, -100.0, -k, -k, -100.0, 0.0, -100.0],
+            [0.0, -100.0, k, -100.0, 100.0, -k, 100.0, 0.0],
+        ]
+    }
+
+    /// The text object of type `text` on `frame`, and how much of its path its brackets span.
+    fn on_path(text: &str, frame: FrameKind) -> (TextObject, f64) {
+        let mut st = story(text, &[0.0], &Para::default());
+        st.frames = vec![frame];
+        let node = st.node(NodeId(1), 0, (0.0, 0.0), Affine::IDENTITY).unwrap();
+        let NodeKind::Text(t) = node.kind else { panic!("not type") };
+        let (a, b) = t.kind.path_span().unwrap();
+        (*t, b - a)
+    }
+
+    /// Round a closed path the file writes the end bracket unwrapped, past the last segment (the
+    /// start plus the run): the type keeps that run, nearly the whole circle here, not the bit
+    /// from the start to the path's end.
+    #[test]
+    fn type_on_a_closed_path_keeps_its_unwrapped_end() {
+        let Some(FrameKind::OnPath { start, end, .. }) = on_path_frame(&circle(), [3.86426, 7.85426]) else { panic!("on a path") };
+        assert!((start - 3.86426).abs() < 1e-9 && (end - 3.85426).abs() < 1e-9, "{start} {end}");
+        let (t, span) = on_path("type", on_path_frame(&circle(), [3.86426, 7.85426]).unwrap());
+        assert!((span - 0.9975).abs() < 1e-3, "{span}");
+        assert_eq!(t.plain_text(), "type");
+        // Wrapped the other way, or below zero, the brackets are the same places.
+        for range in [[3.86426, 3.85426], [-0.13574, 3.85426]] {
+            let (_, other) = on_path("type", on_path_frame(&circle(), range).unwrap());
+            assert!((other - span).abs() < 1e-6, "{range:?}: {other}");
+        }
+        // Values that aren't numbers fall back to the start of the path, a full turn.
+        let Some(FrameKind::OnPath { start, end, .. }) = on_path_frame(&circle(), [f64::NAN, f64::INFINITY]) else { panic!("on a path") };
+        assert!(start.is_finite() && end.is_finite());
+    }
+
+    /// A range inside the loop is kept as it is, and a run of exactly the loop is a full turn,
+    /// where a short line of type doesn't overflow.
+    #[test]
+    fn type_on_a_closed_path_keeps_a_range_inside_it_and_a_full_turn() {
+        let (_, half) = on_path("type", on_path_frame(&circle(), [0.5, 2.5]).unwrap());
+        assert!((half - 0.5).abs() < 1e-3, "{half}");
+        let (t, full) = on_path("type", on_path_frame(&circle(), [1.0, 5.0]).unwrap());
+        assert!((full - 1.0).abs() < 1e-9, "{full}");
+        assert!(!vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t).overflow, "a short line fits a full turn");
+    }
+
+    /// An open path keeps clamping: a range past its end stops at it.
+    #[test]
+    fn type_on_an_open_path_clamps_its_range() {
+        let open: Vec<[f64; 8]> = circle().into_iter().take(2).collect();
+        let Some(FrameKind::OnPath { start, end, .. }) = on_path_frame(&open, [0.5, 7.0]) else { panic!("on a path") };
+        assert_eq!((start, end), (0.5, 2.0));
+        let (_, span) = on_path("type", on_path_frame(&open, [0.5, 7.0]).unwrap());
+        assert!((span - 0.75).abs() < 1e-3, "{span}");
     }
 
     /// A point-type story of `text` whose lines start at the heights `ys` (the layout's own: where
@@ -866,9 +1064,62 @@ mod tests {
                     fill: Some(Color::BLACK),
                     stroke: None,
                     stroke_width: 1.0,
+                    caps: 0,
                 },
             )],
+            path_spacing: 0.0,
         }
+    }
+
+    /// A layout of glyphs `advances` wide round a circle of radius `radius` (y down), from its left,
+    /// outside it (their feet towards its centre) or inside it, the length of the circle between
+    /// their centres `fraction` of their advances' mean.
+    fn round_layout(advances: &[f64], radius: f64, outside: bool, fraction: f64) -> Val {
+        let sign = if outside { 1.0 } else { -1.0 };
+        let (mut xs, mut ys, mut matrices, mut ends) = (vec![], vec![], vec![], vec![0.0]);
+        let mut angle = std::f64::consts::PI;
+        for (i, a) in advances.iter().enumerate() {
+            if i > 0 {
+                angle += sign * (advances[i - 1] + a) * 0.5 * fraction / radius;
+            }
+            // Outside, clockwise on the page (y down); inside, the other way round.
+            let along = (-angle.sin() * sign, angle.cos() * sign);
+            let centre = (radius * angle.cos(), radius * angle.sin());
+            xs.push(centre.0 - along.0 * a * 0.5);
+            ys.push(centre.1 - along.1 * a * 0.5);
+            matrices.extend([along.0, along.1, -along.1, along.0, 0.0, 0.0]);
+            ends.push(ends[i] + a);
+        }
+        let nums = |v: &[f64]| v.iter().map(|n| format!("{n}")).collect::<Vec<_>>().join(" ");
+        let doc = format!(
+            "/0 << /99 /F /6 [ << /99 /L /6 [ << /99 /S /6 [ << /99 /G /21 << /1 [ {} ] /2 [ {} ] /3 [ {} ] /4 [ {} ] >> >> ] >> ] >> ] >>",
+            nums(&xs),
+            nums(&ys),
+            nums(&matrices),
+            nums(&ends)
+        );
+        read(doc.as_bytes()).unwrap().get("0").unwrap().clone()
+    }
+
+    /// The file lays type on a path out closer round the outside of a curve and further apart round
+    /// the inside: the spacing that does that is read from its layout, as the text engine's model
+    /// has it (length + turn × spacing = advance).
+    #[test]
+    fn the_layout_of_type_on_a_path_gives_its_spacing() {
+        let advances = [20.0, 30.0, 10.0, 25.0, 20.0];
+        // Outside a circle of radius 100, 10 above the path: the centres are 100/110 of the advances apart.
+        let spacing = path_spacing(&round_layout(&advances, 100.0, true, 100.0 / 110.0));
+        assert!((spacing - 10.0).abs() < 1e-6, "{spacing}");
+        // Inside it, 20 above the path: 100/80 of them.
+        let spacing = path_spacing(&round_layout(&advances, 100.0, false, 100.0 / 80.0));
+        assert!((spacing - 20.0).abs() < 1e-6, "{spacing}");
+        // At their advances: none.
+        assert!(path_spacing(&round_layout(&advances, 100.0, true, 1.0)).abs() < 1e-6);
+        // Corners (here a turn of about four radians from glyph to glyph) aren't taken for a curve.
+        assert_eq!(path_spacing(&round_layout(&advances, 5.0, true, 1.0)), 0.0);
+        // A straight line turns nowhere, and a layout without glyphs says nothing.
+        assert_eq!(path_spacing(&round_layout(&advances, 1e12, true, 0.9)), 0.0);
+        assert_eq!(path_spacing(&read(b"/99 /F").unwrap()), 0.0);
     }
 
     /// The leading of the text object a story comes in as.

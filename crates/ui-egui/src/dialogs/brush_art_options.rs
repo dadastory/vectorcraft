@@ -9,18 +9,22 @@
 //! open).
 //! Scatter: per value (`size`, `spacing`, `scatter` %, `rotation` °) `…Min`, `…Max` and `…Mode`
 //! (`fixed` | `random` | `pressure`), `rotationRelativeTo` (`page` | `path`).
-//! Art: `width` (%), `scaleMode` (`proportional` | `stretch` | `betweenGuides`), `guideStart` and
+//! Art: `width` (%), `widthMode` (`fixed` | `pressure`), `widthMax` (the width at the heaviest pen
+//! pressure, %), `scaleMode` (`proportional` | `stretch` | `betweenGuides`), `guideStart` and
 //! `guideEnd` (% of the art's length), `direction` (`leftToRight` …), `flipAlong`, `flipAcross`,
 //! `overlap` (bend on each run between sharp corners).
 //! Pattern: `scale`, `spacing` (%), `fit` (`stretch` | `addSpace` | `approximate`), `flipAlong`,
-//! `flipAcross`, `__tiles` (slot → preview key, for the tiles the brush has).
+//! `flipAcross`, `outerCornerTile` and `innerCornerTile` (`original`: the corner art the brush
+//! draws there | `none` | `autoCentered` | `autoBetween` | `autoSliced` | `autoOverlap`: a tile
+//! made from the side tile),
+//! `__tiles` (slot → preview key, for the tiles the brush has).
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use egui::{Color32, Sense, Stroke, pos2, vec2};
 use serde_json::{Map, Value, json};
-use vectorcraft_brush::{ArtBrush, ArtScale, Brush, BrushKind, Colorization, Direction, PatternBrush, PatternFit, Scatter, Variation};
+use vectorcraft_brush::{ArtBrush, ArtScale, Brush, BrushKind, Colorization, CornerSource, Direction, PatternBrush, PatternFit, Scatter, Variation};
 use vectorcraft_color::{Color, Paint};
 use vectorcraft_doc::{Appearance, Document, Node, NodeId};
 
@@ -39,6 +43,43 @@ const DIRECTIONS: [Direction; 4] = [Direction::LeftToRight, Direction::RightToLe
 /// Pattern brush tiles: (field of the definition, slot), in the dialog's order.
 const TILES: [(&str, &str); 5] =
     [("outer_corner", "outerCorner"), ("side", "side"), ("inner_corner", "innerCorner"), ("start", "start"), ("end", "end")];
+
+/// Pattern brush corner tiles: (dialog field, art field of the definition, source field, art field
+/// of the other kind of corner).
+const CORNER_TILES: [(&str, &str, &str, &str); 2] =
+    [("outerCornerTile", "outer_corner", "outer_source", "inner_corner"), ("innerCornerTile", "inner_corner", "inner_source", "outer_corner")];
+
+/// The art field that corner tile `field` draws with in definition `def`: its own art, or, with
+/// neither art nor a source, the other kind of corner's art (as [`PatternBrush`] draws it).
+fn corner_art_field<'a>(def: Option<&Value>, field: &'a str) -> Option<&'a str> {
+    let set = |f: &str| def.and_then(|d| d.get(f)).is_some_and(|v| !v.is_null());
+    let (_, art, source, other) = CORNER_TILES.into_iter().find(|(_, art, _, _)| *art == field)?;
+    if set(art) {
+        Some(art)
+    } else if !set(source) && set(other) {
+        Some(other)
+    } else {
+        None
+    }
+}
+
+/// The dialog field that records that corner tile `key`'s menu was set.
+fn corner_set_key(key: &str) -> String {
+    format!("__{key}Set")
+}
+
+/// Sets corner tile `key` to `choice` from its menu.
+pub(super) fn choose_corner(d: &mut Dialog, key: &str, choice: &str) {
+    d.fields.insert(key.into(), json!(choice));
+    note_set(d, key);
+}
+
+/// Records that field `field` was set, from its menu or `ui.dialog.set`, when it is a corner tile.
+pub(super) fn note_set(d: &mut Dialog, field: &str) {
+    if CORNER_TILES.iter().any(|(key, ..)| *key == field) {
+        d.fields.insert(corner_set_key(field), json!(true));
+    }
+}
 
 /// The most key colours offered.
 const MAX_COLORS: usize = 16;
@@ -104,6 +145,8 @@ pub(super) fn fields(b: &Brush, def: Value, f: &mut Map<String, Value>) {
                 ArtScale::BetweenGuides { start, end } => ("betweenGuides", start, end),
             };
             f.insert("width".into(), json!(a.width));
+            f.insert("widthMode".into(), json!(a.width_mode.unwrap_or_default().id()));
+            f.insert("widthMax".into(), json!(a.width_range().1));
             f.insert("scaleMode".into(), json!(mode));
             f.insert("guideStart".into(), json!(start * 100.0));
             f.insert("guideEnd".into(), json!(end * 100.0));
@@ -118,6 +161,10 @@ pub(super) fn fields(b: &Brush, def: Value, f: &mut Map<String, Value>) {
             f.insert("fit".into(), json!(id_of(&p.fit)));
             f.insert("flipAlong".into(), json!(p.flip_along));
             f.insert("flipAcross".into(), json!(p.flip_across));
+            for ((key, art, _, _), source) in CORNER_TILES.into_iter().zip([p.outer_source, p.inner_source]) {
+                let choice = if corner_art_field(Some(&def), art).is_some() { "original" } else { source.map_or("none", CornerSource::id) };
+                f.insert(key.into(), json!(choice));
+            }
             // A preview key per tile the brush has: its art's hash, so a changed tile redraws.
             let tiles: Map<String, Value> = TILES
                 .iter()
@@ -157,6 +204,14 @@ fn scatter_mode(d: &Dialog, key: &str) -> Variation {
     Variation::parse(&d.str(&mode_key(key))).unwrap_or_default()
 }
 
+/// How an art brush's width varies: Fixed or Pressure.
+fn art_width_mode(d: &Dialog) -> Variation {
+    match Variation::parse(&d.str("widthMode")) {
+        Some(Variation::Pressure) => Variation::Pressure,
+        _ => Variation::Fixed,
+    }
+}
+
 /// `brush.options` params from the fields.
 pub(super) fn params(d: &Dialog) -> Value {
     let mut p = match d.str("__type").as_str() {
@@ -177,8 +232,11 @@ pub(super) fn params(d: &Dialog) -> Value {
                 },
                 _ => ArtScale::Stretch,
             };
+            let pressure = art_width_mode(d) == Variation::Pressure;
             json!({
                 "width": clamped(d, "width", ArtBrush::WIDTH_RANGE),
+                "width_mode": if pressure { json!(Variation::Pressure.id()) } else { Value::Null },
+                "width_max": if pressure { json!(clamped(d, "widthMax", ArtBrush::WIDTH_RANGE)) } else { Value::Null },
                 "scale": serde_json::to_value(scale).unwrap_or_default(),
                 "direction": id_of(&parse_field::<Direction>(d, "direction")),
                 "flip_along": d.bool("flipAlong"),
@@ -186,13 +244,37 @@ pub(super) fn params(d: &Dialog) -> Value {
                 "overlap": d.bool("overlap"),
             })
         }
-        _ => json!({
-            "scale": clamped(d, "scale", PatternBrush::SCALE_RANGE),
-            "spacing": clamped(d, "spacing", PatternBrush::SPACING_RANGE),
-            "fit": id_of(&parse_field::<PatternFit>(d, "fit")),
-            "flip_along": d.bool("flipAlong"),
-            "flip_across": d.bool("flipAcross"),
-        }),
+        _ => {
+            let mut p = json!({
+                "scale": clamped(d, "scale", PatternBrush::SCALE_RANGE),
+                "spacing": clamped(d, "spacing", PatternBrush::SPACING_RANGE),
+                "fit": id_of(&parse_field::<PatternFit>(d, "fit")),
+                "flip_along": d.bool("flipAlong"),
+                "flip_across": d.bool("flipAcross"),
+            });
+            // None or an automatic tile replaces the corner art. Original keeps the art the corner
+            // draws, the other kind of corner's art included, so changing the other kind leaves it.
+            // A None the menu was not set to, on a corner without art or a source, leaves the
+            // definition as it is: that corner still draws the other kind's art when it gets some.
+            let def = d.fields.get("__def");
+            for (key, art, source, other) in CORNER_TILES {
+                let choice = d.str(key);
+                let unset = |f: &str| def.and_then(|d| d.get(f)).is_none_or(Value::is_null);
+                if choice == CornerSource::None.id() && !d.bool(&corner_set_key(key)) && unset(source) && corner_art_field(def, art).is_none() {
+                    continue;
+                }
+                if let Some(s) = CornerSource::parse(&choice) {
+                    p[art] = Value::Null;
+                    p[source] = json!(s.id());
+                } else if choice == "original"
+                    && let Some(from) = corner_art_field(def, art).filter(|f| *f != art)
+                    && CORNER_TILES.iter().find(|(_, a, _, _)| *a == other).is_some_and(|(k, ..)| d.str(k) != "original")
+                {
+                    p[art] = def.and_then(|d| d.get(from)).cloned().unwrap_or_default();
+                }
+            }
+            p
+        }
     };
     p["colorization"] = serde_json::to_value(colorization(d)).unwrap_or_default();
     p
@@ -211,7 +293,7 @@ pub(super) fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) 
     ui.add_space(10.0);
     // The brush as OK would make it, on a sample stroke.
     let ty = d.str("__type");
-    stroke_preview(ui, &ty, edited_def(d), vec2(PREVIEW_W, 64.0));
+    stroke_preview(app, ui, &ty, edited_def(d), vec2(PREVIEW_W, 64.0));
 }
 
 /// The brush definition as OK would make it: `__def` with the fields' params.
@@ -285,7 +367,18 @@ fn scatter_body(ui: &mut egui::Ui, d: &mut Dialog) {
 }
 
 fn art_body(ui: &mut egui::Ui, d: &mut Dialog) {
-    slider_row(ui, d, "width", tl!("Width:"), ArtBrush::WIDTH_RANGE);
+    // Width, then the width at the heaviest pen pressure (only with Pressure) and how it varies.
+    let rail = Tokens::get(ui.ctx()).input_border;
+    let range = ArtBrush::WIDTH_RANGE;
+    widgets::label_row(ui, tl!("Width:"), LABEL_W, |ui| {
+        super::form::slider_field_named(ui, d, "width", tl!("Width:"), range.0..=range.1, "%", &|_| rail);
+        let mode = art_width_mode(d);
+        number(ui, d, "widthMax", range, "%", mode == Variation::Pressure);
+        let modes = [Variation::Fixed, Variation::Pressure];
+        if let Some(m) = widgets::dropdown(ui, "brush-art-width-mode", mode.label(), &modes.map(Variation::label), 104.0).and_then(|i| modes.get(i)) {
+            d.fields.insert("widthMode".into(), json!(m.id()));
+        }
+    });
     ui.add_space(4.0);
     widgets::section_header(ui, tl!("Brush Scale Options"));
     let scales = [
@@ -354,21 +447,44 @@ fn pattern_body(ui: &mut egui::Ui, d: &mut Dialog) {
     radios(ui, d, "fit", &fits);
 }
 
-/// The pattern's five tiles, each with its art (or None when the brush has no such tile).
-fn tiles(ui: &mut egui::Ui, d: &Dialog) {
+/// What a corner tile can be: (choice, label). Original (the corner art the brush draws there) is
+/// offered only when the brush draws corner art there.
+fn corner_choices() -> [(&'static str, &'static str); 6] {
+    [
+        ("original", tl!("Original")),
+        (CornerSource::None.id(), tl!("None")),
+        (CornerSource::AutoCentered.id(), tl!("Auto-Centered")),
+        (CornerSource::AutoBetween.id(), tl!("Auto-Between")),
+        (CornerSource::AutoSliced.id(), tl!("Auto-Sliced")),
+        (CornerSource::AutoOverlap.id(), tl!("Auto-Overlap")),
+    ]
+}
+
+/// The pattern's five tiles, each with its art (or None when the brush has no such tile). Below
+/// each corner tile, a menu sets it to the brush's art, None or a tile made from the side tile.
+fn tiles(ui: &mut egui::Ui, d: &mut Dialog) {
     let t = Tokens::get(ui.ctx());
     let names = [tl!("Outer Corner Tile"), tl!("Side Tile"), tl!("Inner Corner Tile"), tl!("Start Tile"), tl!("End Tile")];
-    let keys = d.fields.get("__tiles");
+    let keys = d.fields.get("__tiles").cloned();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         for ((field, slot), name) in TILES.into_iter().zip(names) {
+            let corner = CORNER_TILES.iter().find(|(_, art, _, _)| *art == field).map(|(key, ..)| *key);
+            // The art the tile draws with: its own, or a corner's that falls back on the other's.
+            let drawn = if corner.is_some() { corner_art_field(d.fields.get("__def"), field) } else { Some(field) };
+            let drawn_slot = drawn.and_then(|f| TILES.iter().find(|(tf, _)| *tf == f)).map_or(slot, |(_, s)| *s);
+            let choices: Vec<(&str, &str)> = corner_choices().into_iter().filter(|(c, _)| drawn.is_some() || *c != "original").collect();
+            let choice = corner.map(|key| d.str(key));
+            // The label of the corner's choice when it shows no art.
+            let shown = choice.as_deref().filter(|c| *c != "original");
+            let label = shown.and_then(|c| choices.iter().find(|(id, _)| *id == c)).map_or(tl!("None"), |(_, l)| *l);
             ui.vertical(|ui| {
                 let (r, resp) = ui.allocate_exact_size(vec2(76.0, 44.0), Sense::hover());
                 ui.painter().rect_filled(r, 0.0, Color32::WHITE);
-                let key = keys.and_then(|k| k.get(slot)).and_then(Value::as_str);
+                let key = keys.as_ref().filter(|_| shown.is_none()).and_then(|k| k.get(drawn_slot)).and_then(Value::as_str);
                 let tex = key.and_then(|key| {
                     widgets::doc_preview(ui, key, r.size(), |w, h| {
-                        let art: Node = serde_json::from_value(d.fields.get("__def")?.get(field)?.clone()).ok()?;
+                        let art: Node = serde_json::from_value(d.fields.get("__def")?.get(drawn?)?.clone()).ok()?;
                         tile_doc(&art, w, h)
                     })
                 });
@@ -377,18 +493,21 @@ fn tiles(ui: &mut egui::Ui, d: &Dialog) {
                         ui.painter().image(tex.id(), r, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                     }
                     None => {
-                        ui.painter().text(
-                            r.center(),
-                            egui::Align2::CENTER_CENTER,
-                            tl!("None"),
-                            egui::FontId::proportional(11.5),
-                            Color32::from_gray(140),
-                        );
+                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(10.5), Color32::from_gray(140));
                     }
                 }
                 ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, t.input_border), egui::StrokeKind::Inside);
                 resp.on_hover_text(name);
                 ui.add_sized(vec2(76.0, 14.0), egui::Label::new(egui::RichText::new(name).size(10.5).color(t.text_dim)).truncate());
+                if let (Some(key), Some(cur)) = (corner, &choice) {
+                    let current = choices.iter().find(|(id, _)| id == cur).map_or(tl!("None"), |(_, l)| *l);
+                    let labels: Vec<&str> = choices.iter().map(|(_, l)| *l).collect();
+                    if let Some((id, _)) =
+                        widgets::dropdown_named(ui, ("brush-pattern-corner", key), Some(name), current, &labels, 76.0).and_then(|i| choices.get(i))
+                    {
+                        choose_corner(d, key, id);
+                    }
+                }
             });
         }
     });
@@ -439,7 +558,7 @@ fn tip_sample(ui: &mut egui::Ui, def: &Value, ty: &str, method: Colorization, na
         ui.painter().image(tex.id(), r, egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
     }
     ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, t.input_border), egui::StrokeKind::Inside);
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, name));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, name));
 }
 
 /// A document of `w` × `h` showing brush definition `def` (of type `ty`) with colorization

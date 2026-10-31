@@ -12,7 +12,10 @@ use vectorcraft_geom::Vec2;
 use super::edit::selected_roots;
 use super::pathops::Beside;
 use super::select::{selectable_ids, walk_selectable};
-use super::*;
+use super::{
+    CommandSpec, EngineError, Point, Result, Session, bad, bool_or, checked_ids_param, cmd, f64_or, f64_req, has_doc, has_selection, id_param, ok,
+    str_param,
+};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -231,7 +234,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Document Color Mode",
             ["File", "Document Color Mode"],
             None,
-            "{mode: \"cmyk\"|\"rgb\", convert?: true (convert every colour of the art, symbols, pattern tiles and swatches through the colour settings; swatch links kept; Gray colours stay Gray, on the black plate), intent?, grays?: \"profile\" (default: RGB greys separate through the CMYK profile like any colour, into four-colour greys and a rich black) | \"black\" (to CMYK, RGB greys with R = G = B go on the black plate only, K = their grey value)} → {changed}",
+            "{mode: \"cmyk\"|\"rgb\", convert?: true (convert every color of the art (opacity masks included), symbols, graph designs, pattern tiles, graphic styles, brushes and swatches through the color settings; swatch links kept; Gray colors stay Gray, on the black plate), intent?, grays?: \"profile\" (default: RGB grays separate through the CMYK profile like any color, into four-color grays and a rich black) | \"black\" (to CMYK, RGB grays with R = G = B go on the black plate only, K = their gray value)} → {changed: how many colors of the art, symbols, graph designs and pattern tiles changed; the colors of graphic styles and brushes are not counted}",
             has_doc,
             super::colormgmt::convert_mode
         ),
@@ -269,11 +272,11 @@ fn candidates(s: &Session, f: impl Fn(&Node) -> bool) -> Result<Vec<NodeId>> {
 }
 
 fn finish_same(s: &mut Session, cmd: &str, ids: Vec<NodeId>) -> Result<Value> {
-    let n = ids.len();
     let from = s.doc()?.selection.objects.clone();
     s.select(|_, sel| sel.set(ids))?;
-    s.doc_mut()?.last_selection_cmd = Some((cmd.to_string(), json!({}), from));
-    Ok(json!({ "count": n }))
+    let st = s.doc_mut()?;
+    st.last_selection_cmd = Some((cmd.to_string(), json!({}), from));
+    Ok(json!({ "count": st.selection.objects.len() }))
 }
 
 fn same(s: &mut Session, cmd: &str, eq: fn(&Node, &Node) -> bool) -> Result<Value> {
@@ -312,9 +315,9 @@ fn same_text(s: &mut Session, cmd: &str, eq: fn(&CharStyle, &CharStyle) -> bool)
 
 fn by_kind(s: &mut Session, f: impl Fn(&Node) -> bool) -> Result<Value> {
     let ids = candidates(s, f)?;
-    let n = ids.len();
     s.select(|_, sel| sel.set(ids))?;
-    Ok(json!({ "count": n }))
+    // The objects selected, after Lock Guides has left out guide paths.
+    Ok(json!({ "count": s.doc()?.selection.objects.len() }))
 }
 
 fn direction_handles(s: &mut Session, _: &Value) -> Result<Value> {
@@ -617,7 +620,7 @@ fn lock_guides(s: &mut Session, p: &Value) -> Result<Value> {
     if v {
         let active = s.active;
         for (i, st) in s.docs.iter_mut().enumerate() {
-            if Some(i) != active && crate::deselect_guides(&st.doc, &mut st.selection) {
+            if Some(i) != active && crate::deselect_hidden(&s.menu, &st.doc, &mut st.selection) {
                 st.revision += 1;
             }
         }
