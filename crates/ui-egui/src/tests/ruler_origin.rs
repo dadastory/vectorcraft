@@ -24,7 +24,7 @@ fn context() -> egui::Context {
 
 fn frame(app: &mut VectorcraftApp, ctx: &egui::Context, events: Vec<Event>, draw: fn(&mut VectorcraftApp, &mut Ui)) -> Vec<(String, Rect)> {
     let raw = egui::RawInput {
-        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1700.0, 900.0))),
         time: Some(ctx.input(|i| i.time) + 0.05),
         events,
         ..Default::default()
@@ -80,7 +80,7 @@ fn ruler_origin_drag_uses_the_rotated_zoomed_view_and_commits_only_on_release() 
     assert!(st.doc.ruler_origin_for(0).distance(goal) < 1e-4, "{:?}", st.doc.ruler_origin_for(0));
     assert_eq!(st.history.undo.len(), undo + 1);
     assert_eq!(st.doc.art_bounds(), None, "the drawing tool never receives the corner drag");
-    assert!(st.doc.guides.is_empty());
+    assert!(st.doc.ruler_guides().is_empty());
     let origin = st.doc.ruler_origin_for(0);
     app.run("edit.undo", json!({})).unwrap();
     assert_eq!(&*app.session.doc().unwrap().doc, &*before);
@@ -108,6 +108,20 @@ fn ruler_origin_double_click_resets_to_the_active_artboard() {
     assert_eq!(app.session.doc().unwrap().history.undo.len(), undo + 1);
     app.run("edit.undo", json!({})).unwrap();
     assert_eq!(app.ruler_origin(), Point::new(125.0, 90.0));
+}
+
+/// Tab does not stop on the rulers or on the box where they meet, which only the pointer uses.
+#[test]
+fn tab_skips_the_rulers_and_their_origin_box() {
+    let mut app = app();
+    let ctx = context();
+    frame(&mut app, &ctx, vec![], canvas::show);
+    let rulers = ["ruler-top", "ruler-left", "ruler-corner"].map(egui::Id::unique);
+    assert!(rulers.iter().all(|&id| ctx.read_response(id).is_some()), "the rulers are drawn");
+    let stops = crate::widgets::accessibility_tests::tab_stops(&ctx, 20, |events| {
+        frame(&mut app, &ctx, events, canvas::show);
+    });
+    assert!(!stops.iter().any(|id| rulers.contains(id)), "{stops:?}");
 }
 
 #[test]

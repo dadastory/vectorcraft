@@ -25,8 +25,11 @@ pub fn paint_chip(ui: &Ui, rect: Rect, paint: &Paint) {
 }
 
 /// Draw a gradient preview into `rect`, laid out as the gradient would be on an object of that
-/// shape: linear along its angle, radial from the centre, freeform from its colour points.
+/// shape: linear along its angle, radial from the centre, freeform from its colour points. The
+/// rect is rounded to whole pixels, as filled rectangles are when drawn, so the chip lines up with
+/// a colour chip beside it (#3826).
 pub fn gradient_chip(ui: &Ui, rect: Rect, gradient: &vectorcraft_color::GradientPaint) {
+    let rect = egui::emath::GuiRounding::round_to_pixels(rect, ui.pixels_per_point());
     if !(rect.width() > 0.0 && rect.height() > 0.0) {
         return;
     }
@@ -68,10 +71,10 @@ pub(super) fn gradient_chip_colors(gp: &vectorcraft_color::GradientPaint, width:
     let n = (cols + 1) * (rows + 1);
     if gp.gradient.kind == GradientKind::Freeform {
         let Some(painted) = vectorcraft_color::freeform::painted_box(b) else { return vec![Color32::TRANSPARENT; n] };
-        let field = gp.freeform_on(painted).field(vectorcraft_color::freeform::spread_scale(painted));
+        let field = gp.freeform_on(painted).model_field(vectorcraft_color::freeform::spread_scale(painted));
         return (0..n)
             .map(|k| {
-                let ([r, g, b], _) = field.sample(at(k));
+                let ([r, g, b], _) = field.display_sample(at(k));
                 let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
                 Color32::from_rgb(q(r), q(g), q(b))
             })
@@ -79,7 +82,11 @@ pub(super) fn gradient_chip_colors(gp: &vectorcraft_color::GradientPaint, width:
     }
     // A placed gradient keeps its direction; a fresh one is fitted to the chip at its angle.
     let angle = gp.geom.map_or(gp.angle, |g| g.angle_deg());
-    let geom = GradientGeom::fit(gp.gradient.kind, b, if angle.is_finite() { angle } else { 0.0 });
+    let mut geom = GradientGeom::fit(gp.gradient.kind, b, if angle.is_finite() { angle } else { 0.0 });
+    // A mirrored conic's chip turns the way the gradient does on its object.
+    if gp.gradient.kind == GradientKind::Conic && gp.geom.is_some_and(|g| g.is_mirrored()) {
+        geom.aspect = -1.0;
+    }
     (0..n)
         .map(|k| {
             let t = geom.param_at(gp.gradient.kind, at(k)).clamp(0.0, 1.0) as f32;

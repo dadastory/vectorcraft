@@ -89,8 +89,10 @@ pub(crate) fn apply_desired(sg: &mut [SGlyph], j: &JustificationOptions, scale_g
         let base = g.adv;
         if g_des != 1.0 {
             g.adv *= g_des;
+            g.tracking *= g_des;
             g.sx *= g_des;
             g.dx *= g_des;
+            g.kern_shift *= g_des;
         }
         f.width = g.adv;
         f.scale = g_des;

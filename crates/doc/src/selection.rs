@@ -39,21 +39,35 @@ pub struct Selection {
     /// clears them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slices: Vec<NodeId>,
-    /// Ruler guides selected with a selection tool, as indexes into [`Document::guides`]. A new
+    /// Ruler guides selected with a selection tool, by node id ([`Document::ruler_guides`]). A new
     /// selection ([`Self::set`]) clears them; Shift-adding or -removing objects keeps them, so
     /// guides and objects can be selected together, in either order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub guides: Vec<usize>,
-    /// A selected ruler guide that is the key object for Align instead of [`Self::key`] (an index
-    /// into [`Document::guides`], one of [`Self::guides`]): the objects line up on it. Never set
-    /// with `key`; [`Self::prune`] clears it when no object is selected to align to it.
+    pub guides: Vec<NodeId>,
+    /// A selected ruler guide that is the key object for Align instead of [`Self::key`] (one of
+    /// [`Self::guides`]): the objects line up on it. Never set with `key`; [`Self::prune`] clears
+    /// it when no object is selected to align to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key_guide: Option<usize>,
+    pub key_guide: Option<NodeId>,
     /// The new art on a locked artboard that this selection keeps editable
     /// ([`Document::new_art`]). Undo, Redo and a failed batch restore it with the selection, and
     /// the engine then sets the document's from it. Editing state, never saved.
     #[serde(skip)]
     pub new_art: Arc<HashSet<NodeId>>,
+    /// An object of a dynamic symbol instance's art, selected with Direct Selection: the instance
+    /// is the one selected object, and solid fill and stroke changes go to its own appearance for
+    /// that object ([`crate::symbol_overrides`]). Any other selection change clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_part: Option<SymbolPart>,
+}
+
+/// See [`Selection::symbol_part`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolPart {
+    /// The symbol instance.
+    pub instance: NodeId,
+    /// The object in the symbol's art, as [`crate::symbol_overrides::part`] names it.
+    pub path: Vec<u32>,
 }
 
 impl Selection {
@@ -79,6 +93,13 @@ impl Selection {
         self.slices.clear();
         self.guides.clear();
         self.key_guide = None;
+        self.symbol_part = None;
+    }
+    /// Select only instance `instance`, with the object at `path` of its symbol's art (see
+    /// [`Selection::symbol_part`]).
+    pub fn set_symbol_part(&mut self, instance: NodeId, path: Vec<u32>) {
+        self.set([instance]);
+        self.symbol_part = Some(SymbolPart { instance, path });
     }
     /// Is there a key for Align: an object or a guide?
     pub fn has_key(&self) -> bool {
@@ -93,6 +114,7 @@ impl Selection {
     pub fn add(&mut self, id: NodeId) {
         self.target = None;
         self.slices.clear();
+        self.symbol_part = None;
         if !self.objects.contains(&id) {
             self.objects.push(id);
         }
@@ -100,6 +122,7 @@ impl Selection {
     pub fn remove(&mut self, id: NodeId) {
         self.target = None;
         self.slices.clear();
+        self.symbol_part = None;
         self.objects.retain(|x| *x != id);
         self.anchors.remove(&id);
         self.segments.remove(&id);
@@ -116,10 +139,10 @@ impl Selection {
             }
         }
     }
-    /// Select ruler guides `indexes` (see [`Selection::guides`]) and nothing else.
-    pub fn set_guides(&mut self, indexes: impl IntoIterator<Item = usize>) {
+    /// Select ruler guides `ids` (see [`Selection::guides`]) and nothing else.
+    pub fn set_guides(&mut self, ids: impl IntoIterator<Item = NodeId>) {
         self.clear();
-        for i in indexes {
+        for i in ids {
             if !self.guides.contains(&i) {
                 self.guides.push(i);
             }
@@ -127,7 +150,8 @@ impl Selection {
     }
     /// Add ruler guide `i` to the selection, or take it out, keeping the selected objects (a
     /// Shift-click on a guide).
-    pub fn toggle_guide(&mut self, i: usize) {
+    pub fn toggle_guide(&mut self, i: NodeId) {
+        self.symbol_part = None;
         if let Some(k) = self.guides.iter().position(|g| *g == i) {
             self.guides.remove(k);
             if self.key_guide == Some(i) {
@@ -177,7 +201,9 @@ impl Selection {
     pub fn prune(&mut self, doc: &Document) {
         // Every id this looks up, found in one walk of the tree.
         let ids = self.objects.iter().chain(self.anchors.keys()).chain(self.segments.keys()).copied().chain(self.key).chain(self.target);
-        let found = doc.index_paths(ids);
+        let mut found = doc.index_paths(ids);
+        // A ruler guide is selected in `guides` only, never as an object, an anchor or the key.
+        found.retain(|_, p| !doc.node_at(p).is_some_and(|n| n.is_ruler_guide()));
         self.objects.retain(|id| found.contains_key(id));
         self.anchors.retain(|id, _| found.contains_key(id));
         self.segments.retain(|id, refs| {
@@ -185,8 +211,12 @@ impl Selection {
             refs.retain(|&(si, seg)| path.subpaths.get(si).is_some_and(|sp| seg < sp.segment_count()));
             !refs.is_empty() && self.objects.contains(id) && self.anchors.contains_key(id)
         });
-        // Guides on a hidden or locked layer can't stay selected.
-        self.guides.retain(|i| doc.guides.get(*i).is_some_and(|g| doc.guide_editable(g)));
+        // Guides that are gone, or hidden or locked (themselves or by their layer), can't stay
+        // selected.
+        if !self.guides.is_empty() {
+            let editable = doc.editable();
+            self.guides.retain(|id| doc.node(*id).is_some_and(|n| n.is_ruler_guide()) && editable(*id));
+        }
         // The key object stays while another selected object lies outside it, or while ruler
         // guides are selected for it to line up (#2143).
         let keep = self.key.and_then(|k| found.get(&k)).and_then(|p| doc.node_at(p)).is_some_and(|n| {
@@ -206,6 +236,27 @@ impl Selection {
         // A key guide needs objects to line up on it, and stays selected.
         if self.key.is_some() || self.objects.is_empty() || self.key_guide.is_some_and(|k| !self.guides.contains(&k)) {
             self.key_guide = None;
+        }
+        // A selected part needs its instance selected alone, with no guides, its symbol dynamic
+        // and the object still in the symbol's art as a path, compound path or type, where neither
+        // it nor a group or layer around it is hidden, locked or a template.
+        let editable_part = |art: &crate::Node, path: &[u32]| {
+            crate::symbol_overrides::part(art, path).is_some_and(crate::symbol_overrides::takes_part_paint)
+                && (0..=path.len())
+                    .all(|k| crate::symbol_overrides::part(art, &path[..k]).is_some_and(|n| n.visible && !n.locked && !n.is_template()))
+        };
+        let part_kept = self.symbol_part.as_ref().is_some_and(|sp| {
+            self.objects == [sp.instance]
+                && self.guides.is_empty()
+                && found.get(&sp.instance).and_then(|p| doc.node_at(p)).is_some_and(|n| match &n.kind {
+                    NodeKind::SymbolInstance { symbol, .. } => {
+                        doc.symbols.iter().find(|s| s.name == *symbol).is_some_and(|s| s.dynamic && editable_part(&s.art, &sp.path))
+                    }
+                    _ => false,
+                })
+        });
+        if !part_kept {
+            self.symbol_part = None;
         }
     }
     /// Deselect the objects that are hidden or locked, themselves or through a group or layer
@@ -238,6 +289,9 @@ impl Selection {
         }
         self.target = None;
         self.slices.clear();
+        if self.symbol_part.as_ref().is_some_and(|sp| gone.contains(&sp.instance)) {
+            self.symbol_part = None;
+        }
         self.objects.retain(|o| !gone.contains(o));
         self.anchors.retain(|id, _| !gone.contains(id));
         self.segments.retain(|id, _| !gone.contains(id));

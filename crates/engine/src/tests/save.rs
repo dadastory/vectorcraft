@@ -72,7 +72,7 @@ fn save_as_takes_on_path_format_and_options() {
     let d = dir("saveas");
     let mut s = session();
     let pdf = path(&d, "doc.pdf");
-    s.execute("file.saveAs", &json!({"path": pdf, "options": {"range": "1", "bogus": 1}})).unwrap();
+    s.execute("file.saveAs", &json!({"path": pdf, "options": {"range": "1", "preview": true}})).unwrap();
     let st = s.doc().unwrap();
     assert_eq!((st.format, st.title()), ("pdf", "doc.pdf".to_string()));
     assert_eq!(Value::Object(st.save_options.clone()), json!({"range": "1"}), "only the format's own options are kept");
@@ -579,7 +579,7 @@ fn units_and_ruler_guides_survive_save_and_reopen() {
         s.execute("file.close", &json!({})).unwrap();
         s.execute("document.open", &json!({"path": p})).unwrap();
         let doc = &s.doc().unwrap().doc;
-        let guides: Vec<_> = doc.guides.iter().map(|g| (g.vertical, g.pos)).collect();
+        let guides: Vec<_> = doc.ruler_guides().iter().map(|g| (g.vertical, g.pos)).collect();
         assert_eq!((doc.units, guides), (vectorcraft_doc::Unit::Millimeters, vec![(true, 50.0), (false, 30.0)]), "{ext}");
     }
     let _ = std::fs::remove_dir_all(d);

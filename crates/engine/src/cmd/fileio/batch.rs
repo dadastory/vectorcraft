@@ -15,12 +15,12 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
     let artboard = p.get("artboard").and_then(Value::as_u64);
     // What an error rolls back besides the documents: session-level state a step may change
     // (paint defaults, drawing mode, clipboard, the Untitled-N count, a begun undo group).
-    let saved = (s.paint.clone(), s.fill_active, s.draw_mode, s.draw_inside, s.clipboard.clone(), s.untitled_counter, s.explicit_undo_group.clone());
     // A drag or typing still in progress is a step of its own, as before Undo: the batch's steps
     // would otherwise run inside it and take its baseline as theirs (#1697).
-    if s.active().is_some() {
+    if s.active().is_some() && !s.previewing {
         super::super::edit::settle_interaction(s)?;
     }
+    let saved = (s.paint.clone(), s.fill_active, s.draw_mode, s.draw_inside, s.clipboard.clone(), s.untitled_counter, s.explicit_undo_group.clone());
     // The documents as they are now, whole: what a failed step brings back. Their art, history,
     // file, format and saved state share their data with the open ones until a step changes them.
     let start = s.docs.clone();
@@ -47,10 +47,18 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
         }
     };
     // Each document the steps edited keeps them as one undo step.
-    s.remember_pending_paint();
-    for st in &mut s.docs {
-        if let Some(it) = st.interaction.take() {
-            st.keep_interaction(it);
+    if !s.previewing {
+        s.remember_pending_paint();
+        for st in &mut s.docs {
+            if let Some(mut it) = st.interaction.take() {
+                // Redo restores the new-art colors the whole batch left, not the ones right after a
+                // color-mode step.
+                if let Some((_, after)) = &mut it.color_mode_paints {
+                    after.clone_from(&s.paint);
+                    s.batch_paint_docs.push(st.uid);
+                }
+                st.keep_interaction(it);
+            }
         }
     }
     // The batch journals itself, whichever document it ends in.
@@ -58,7 +66,9 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(o) = entry.as_object_mut() {
         o.insert("commands".into(), Value::Array(cmds));
     }
-    s.journal.push(("command.batch".into(), entry));
+    if !s.previewing {
+        s.journal.push(("command.batch".into(), entry));
+    }
     Ok(json!({ "results": results }))
 }
 
@@ -66,7 +76,9 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
 /// starts (one for all the steps in that document), so a step may open, switch or close documents.
 /// A step that acts on the active artboard ([`crate::ON_ACTIVE_ARTBOARD`]) and names none gets
 /// `artboard`, as the Artboards panel shows it in the document the step runs in: past that
-/// document's last artboard, the last one. A step that resizes the active artboard
+/// document's last artboard, the last one; a Paste in Place, in Front or in Back step that names
+/// `artboards` keeps them, and one that names neither, while the Artboard tool is chosen with
+/// several artboards selected, pastes on those. A step that resizes the active artboard
 /// ([`crate::FIT_ACTIVE_ARTBOARD`]) and names no `index` gets that artboard as its `index`.
 /// `grouped` gets each step's undo groups, as [`Session::batch_steps`] keeps them.
 fn run_steps(
@@ -82,6 +94,9 @@ fn run_steps(
         if id == "command.batch" {
             return Err(bad("command.batch", "batches cannot nest"));
         }
+        if id == "prefs.import" {
+            return Err(bad("command.batch", "`prefs.import` runs on its own, not as a batch step"));
+        }
         if s.active().is_some() {
             s.begin_interaction(label)?;
         }
@@ -91,9 +106,14 @@ fn run_steps(
         } else {
             crate::FIT_ACTIVE_ARTBOARD.contains(&id.as_str()).then_some("index")
         };
+        // A paste step that names its `artboards` keeps them; one that names neither key, while the
+        // Artboard tool is chosen with several artboards selected, pastes on those.
+        let names_artboards = id.starts_with("edit.pasteIn")
+            && (params.get("artboards").is_some() || (params.get("artboard").is_none() && !crate::cmd::edit::artboard_tool_picks(s).is_empty()));
         if let Some(a) = artboard
             && let Some(key) = key
             && params.get(key).is_none()
+            && !names_artboards
             && let Some(last) = s.active().and_then(|d| d.doc.artboards.len().checked_sub(1))
             && let Some(o) = params.as_object_mut()
         {
@@ -104,6 +124,9 @@ fn run_steps(
         let held: Vec<(u64, Arc<Document>)> = s.docs.iter().filter(|st| st.undo_group.is_some()).map(|st| (st.uid, st.doc.clone())).collect();
         let (v, noted) =
             s.execute_step(&id, &params).map_err(|e| EngineError::Other(format!("batch step {} (`{id}`) failed: {e}", results.len())))?;
+        if s.previewing && s.active().map(|d| d.uid) != start {
+            return Err(bad("command.batch", "a batch preview cannot switch documents"));
+        }
         grouped.push(step_groups(s, start, &held));
         // The step's journal entry records what it took from the preferences or the clock (a
         // save's date, a new document's), as a command of its own would.

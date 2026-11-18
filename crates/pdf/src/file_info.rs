@@ -235,7 +235,9 @@ fn pdf_date(d: DateTime) -> Option<i64> {
 /// Whether `day` is a day of `month` (1 to 12) in `year` (proleptic Gregorian).
 fn in_month(year: i64, month: i64, day: i64) -> bool {
     let ymd = i32::try_from(year).ok().zip(u32::try_from(month).ok()).zip(u32::try_from(day).ok());
-    ymd.is_some_and(|((y, m), d)| chrono::NaiveDate::from_ymd_opt(y, m, d).is_some())
+    ymd.is_some_and(|((y, m), d)| {
+        (|| time::Date::from_calendar_date(y, time::Month::try_from(u8::try_from(m).ok()?).ok()?, u8::try_from(d).ok()?).ok())().is_some()
+    })
 }
 
 /// An XMP date (ISO 16684-1: `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, then optionally `Thh:mm`, `:ss` with
@@ -283,9 +285,11 @@ fn unix([year, month, day, hour, minute, second]: [i64; 6], offset: i64) -> i64 
         .ok()
         .zip(u32::try_from(month).ok())
         .zip(u32::try_from(day).ok())
-        .and_then(|((y, m), d)| chrono::NaiveDate::from_ymd_opt(y, m, d))
-        .zip(chrono::NaiveDate::from_ymd_opt(1970, 1, 1))
-        .map(|(date, epoch)| (date - epoch).num_days())
+        .and_then(|((y, m), d)| {
+            (|| time::Date::from_calendar_date(y, time::Month::try_from(u8::try_from(m).ok()?).ok()?, u8::try_from(d).ok()?).ok())()
+        })
+        .map(|date| (date, time::macros::date!(1970 - 01 - 01)))
+        .map(|(date, epoch)| (date - epoch).whole_days())
         .unwrap_or(0);
     days * 86_400 + hour * 3600 + minute * 60 + second - offset * 60
 }

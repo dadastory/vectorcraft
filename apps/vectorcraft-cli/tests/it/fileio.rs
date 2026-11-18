@@ -4,8 +4,6 @@ use std::process::Command;
 
 use serde_json::Value;
 
-const BIN: &str = env!("CARGO_BIN_EXE_vectorcraft-cli");
-
 /// Returns the path of `name` in `vectorcraft-cli-fileio-<pid>` in the temp folder. The first call
 /// removes that folder and creates it again empty.
 fn tmp(name: &str) -> String {
@@ -20,7 +18,7 @@ fn tmp(name: &str) -> String {
 }
 
 fn ok(args: &[&str]) -> String {
-    let out = Command::new(BIN).args(args).output().unwrap();
+    let out = Command::new(crate::bin()).args(args).output().unwrap();
     assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).unwrap()
 }
@@ -103,6 +101,38 @@ fn images_open_at_their_pixel_size() {
     let png = tmp("tiny.png");
     ok(&["convert", &webp, &png, "--scale", "2"]);
     assert_eq!(&std::fs::read(&png).unwrap()[16..24], [0, 0, 0, 6, 0, 0, 0, 4], "IHDR 6×4");
+}
+
+#[test]
+fn raster_exports_use_document_resolution_unless_overridden() {
+    let source = tmp("resolution.vectorcraft");
+    ok(&["run", "--cmd", "file.new", "--params", r#"{"width":72,"height":36,"rasterEffectsPpi":300}"#, "--export", &source]);
+    for (flags, width, height) in [(vec![], 300u32, 150u32), (vec!["--scale", "1"], 72, 36), (vec!["--ppi", "150", "--scale", "2"], 150, 75)] {
+        for mode in ["run", "convert"] {
+            for format in ["png", "psd"] {
+                let path = tmp(&format!("resolution-{mode}-{width}.{format}"));
+                let mut args = if mode == "run" { vec!["run", "--in", &source, "--export", &path] } else { vec!["convert", &source, &path] };
+                args.extend_from_slice(&flags);
+                ok(&args);
+                let bytes = std::fs::read(&path).unwrap();
+                let dimensions = if format == "png" { &bytes[16..24] } else { &bytes[14..22] };
+                let expected =
+                    if format == "png" { [width.to_be_bytes(), height.to_be_bytes()] } else { [height.to_be_bytes(), width.to_be_bytes()] };
+                assert_eq!(dimensions, expected.concat(), "{args:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn raster_export_rejects_invalid_ppi() {
+    for ppi in ["0", "-150", "NaN", "inf", "high"] {
+        for args in [vec!["run", "--export", "unused.png", "--ppi", ppi], vec!["convert", "unused.svg", "unused.png", "--ppi", ppi]] {
+            let out = Command::new(crate::bin()).args(&args).output().unwrap();
+            assert!(!out.status.success(), "{args:?}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("positive finite number"), "{args:?}: {out:?}");
+        }
+    }
 }
 
 #[test]
@@ -196,7 +226,7 @@ fn convert_writes_legacy_ai_with_its_options() {
     assert!(r["warnings"].to_string().contains("hidden objects are left out"), "{r}");
     assert!(std::fs::read(&one).unwrap().starts_with(b"%!PS-Adobe-3.0"));
     // A value the engine doesn't take is an error.
-    let bad = Command::new(BIN).args(["convert", &src, &tmp("bad.ai"), "--ai-version", "7", "--hidden-objects", "behind"]).output().unwrap();
+    let bad = Command::new(crate::bin()).args(["convert", &src, &tmp("bad.ai"), "--ai-version", "7", "--hidden-objects", "behind"]).output().unwrap();
     assert!(!bad.status.success());
     assert!(String::from_utf8_lossy(&bad.stderr).contains("hiddenObjects"), "{}", String::from_utf8_lossy(&bad.stderr));
 }
@@ -221,7 +251,7 @@ fn convert_and_run_write_ait_templates() {
         assert_eq!(info(ait)["artboards"].as_array().unwrap().len(), 2, "{ait}");
     }
     // A template holds every artboard: one can't be picked.
-    let one = Command::new(BIN).args(["convert", &pdf, &tmp("one.ait"), "--artboard", "0"]).output().unwrap();
+    let one = Command::new(crate::bin()).args(["convert", &pdf, &tmp("one.ait"), "--artboard", "0"]).output().unwrap();
     assert!(!one.status.success());
     assert!(String::from_utf8_lossy(&one.stderr).contains("every artboard"), "{}", String::from_utf8_lossy(&one.stderr));
 }

@@ -1,8 +1,8 @@
 //! EPS export for every EPS path (`document.export {format: eps}`, `document.exportEps`, Export As
 //! → EPS Options): the options parsed from the params, transparency flattened with a flattener
 //! preset, one file of the art's bounds or one per artboard (with a central file of the whole
-//! document when there are several and art shows), the preview and thumbnail rendered,
-//! and the native document embedded for reopening.
+//! document when there are several and art shows), the preview rendered and the thumbnail made
+//! from it, and the native document embedded for reopening.
 
 use std::borrow::Cow;
 
@@ -11,8 +11,9 @@ use serde_json::{Value, json};
 use vectorcraft_doc::Document;
 use vectorcraft_eps::{EpsOptions, Level, Overprint, Preview, Raster};
 use vectorcraft_geom::{Point, Rect};
+use vectorcraft_render::Rendered;
 
-use super::super::flatten::{FlattenOptions, flatten_document};
+use super::super::flatten::{FlattenOptions, expand_transparent_tile_images, flatten_expanded};
 use super::super::{CommandSpec, EngineError, Result, Session, bad, bool_or, cmd, has_doc, str_param};
 use super::{ArtboardPick, Encoded, FormatOption};
 
@@ -32,14 +33,14 @@ pub fn specs() -> Vec<CommandSpec> {
         "Export EPS",
         [],
         None,
-        "{path?, level?: 2|3 (default; PostScript language level: 3 writes smooth gradients and masks transparent image pixels out, 2 steps gradients and writes those pixels white), previewFormat?: none|tiffBw|tiffColor (default: a TIFF preview other apps show), transparentPreview?: true (else on white), overprints?: preserve (default)|discard, flattenerPreset?: \"medium\" (default; high, low or a saved preset: flattener.presets.list), flattener?: {the options of object.flattenTransparency over the preset}, embedFonts?: true (type is always written as outlines, so no fonts are needed), includeLinkedFiles?: false (the embedded document keeps linked images whole, not just their previews), thumbnails?: true (a PNG thumbnail in the file), cmykPostScript?: true (RGB documents written in CMYK), compatibleGradients?: false (stepped gradients at level 3 too), selectedOnly?: false, useArtboards?: true (one file per chosen artboard, artboards?/range?, {stem}_{artboard}.eps, the bounding box the artboard; with two or more, also the central file {stem}.eps first: the whole document, the bounding box the visible art; none when no art shows) | false (one file, the bounding box the visible art, y up from the first artboard's bottom-left corner, even when artboards are named; the default when none are named), format?: \"eps\", artboard?: i | artboards?: [i…] | range?: \"1-3, 5\" (the artboards written; naming them without useArtboards works as useArtboards: true)} → {path, bytes, warnings, files?}; no path → {dataBase64, …}. Transparency is flattened with the preset (EPS has none); the native document rides along in comments, for reopening the file as it was. Same as document.export {format: eps}",
+        "{path?, level?: 2|3 (default; PostScript language level: 3 writes smooth gradients and masks transparent image pixels out, 2 steps gradients and writes those pixels white), previewFormat?: none|tiffBw|tiffColor (default: a TIFF preview other apps show), transparentPreview?: true (else on white), overprints?: preserve (default)|discard, flattenerPreset?: \"medium\" (default; high, low or a saved preset: flattener.presets.list), flattener?: {the options of object.flattenTransparency over the preset}, embedFonts?: true (type is always written as outlines, so no fonts are needed), includeLinkedFiles?: false (the embedded document keeps linked images whole, not just their previews), thumbnails?: true (a PNG thumbnail in the file), cmykPostScript?: true (RGB documents written in CMYK), compatibleGradients?: false (stepped gradients at level 3 too), selectedOnly?: false, useArtboards?: true (one file per chosen artboard, artboards?/range?, {stem}_{artboard}.eps, the bounding box the artboard; with two or more, also the central file {stem}.eps first: the whole document, the bounding box the visible art; none when no art shows) | false (one file, the bounding box the visible art, y up from the first artboard's bottom-left corner, even when artboards are named; the default when none are named), format?: \"eps\", artboard?: i | artboards?: [i…] | range?: \"1-3, 5\" (the artboards written; naming them without useArtboards works as useArtboards: true)} → {path, bytes, warnings, files?}; no path → {dataBase64, …}. Transparency is flattened with the preset (EPS has none); the native document rides along in comments, for reopening the file as it was. Same as document.export {format: eps}. A key EPS doesn't take, and an unknown key inside flattener, are refused",
         has_doc,
         export_eps
     )]
 }
 
 /// The EPS options `document.formats` lists.
-pub(super) const OPTIONS: &[FormatOption] = &[
+pub(crate) const OPTIONS: &[FormatOption] = &[
     super::ARTBOARD,
     super::ARTBOARDS,
     super::RANGE,
@@ -152,6 +153,8 @@ fn parse(p: &Value) -> Result<Settings> {
     let overprint = choice("overprints", q.overprints.clone(), Overprint::from_id, d.overprint, "preserve or discard")?;
     let mut flatten = flattener(&q, &[])?;
     flatten.preserve_overprints &= overprint == Overprint::Preserve;
+    // The writer draws colorized images in their ink.
+    flatten.keeps_colorize = true;
     let level = q.level.as_ref().map(super::dxf::text);
     let eps = EpsOptions {
         level: choice("level", level, Level::from_id, d.level, "2 or 3")?,
@@ -229,14 +232,38 @@ fn pages(doc: &Document, set: &Settings) -> Result<Vec<(Option<usize>, Rect, Poi
     }
 }
 
-/// `rect` of `doc` drawn at a pixel a point (fewer when larger than `max` a side), straight RGBA,
-/// transparent or on white.
-fn render(r: &mut vectorcraft_render::Renderer, doc: &Document, rect: Rect, max: f64, transparent: bool) -> Result<Raster> {
+/// Pixels a point for `rect`: one, or fewer when it is larger than `max` a side.
+fn fit(rect: Rect, max: f64) -> f64 {
     let long = rect.width().max(rect.height());
-    let scale = if long > max { max / long } else { 1.0 };
+    if long > max { max / long } else { 1.0 }
+}
+
+/// `rect` of `doc` drawn at [`fit`]'s scale for `max`, transparent or on white.
+fn render(r: &mut vectorcraft_render::Renderer, doc: &Document, rect: Rect, max: f64, transparent: bool) -> Result<Rendered> {
+    let scale = fit(rect, max);
     vectorcraft_render::raster_size(rect, scale).map_err(|e| bad(C, e))?;
-    let img = r.render_region(doc, rect, scale, !transparent);
-    Ok(Raster { width: img.width, height: img.height, rgba: img.to_straight() })
+    Ok(r.render_region(doc, rect, scale, !transparent))
+}
+
+/// `img` as the writer takes it: straight RGBA.
+fn straight(img: &Rendered) -> Raster {
+    Raster { width: img.width, height: img.height, rgba: img.to_straight() }
+}
+
+/// The thumbnail of `rect` made from `preview`, the same rect rendered larger: at the size a
+/// thumbnail render of `rect` has, each pixel the average of the preview's pixels under it, on white.
+fn thumbnail_of(preview: &Rendered, rect: Rect) -> Result<Raster> {
+    let (width, height) = vectorcraft_render::raster_size(rect, fit(rect, THUMBNAIL)).map_err(|e| bad(C, e))?;
+    let mut rgba = preview.area_resized(width, height).map_err(|e| bad(C, e))?.pixels;
+    // Premultiplied over white: each channel gains the white the pixel's alpha leaves showing.
+    for px in rgba.as_chunks_mut::<4>().0 {
+        let clear = 255 - px[3];
+        for c in &mut px[..3] {
+            *c = c.saturating_add(clear);
+        }
+        px[3] = 255;
+    }
+    Ok(Raster { width, height, rgba })
 }
 
 /// What the file carries to reopen: `doc` (with only artboard `board` when the file is one of
@@ -298,12 +325,17 @@ fn encode_document(doc: &Document, p: &Value, saving: bool) -> Result<Encoded> {
     if pages.is_empty() {
         return Err(bad(C, "the document has no artboard"));
     }
+    // The artboards' background colors, behind the art (the editing data keeps them as colors).
+    let filled = super::export::with_artboard_fills(doc, p, pages.iter().filter_map(|(b, ..)| *b)).map_err(|e| bad(C, e))?;
+    let doc = &*filled;
     let regions: Vec<Rect> = pages.iter().map(|(_, region, _)| *region).collect();
-    let transparent = doc.layers.iter().any(|l| l.shows_transparency());
-    let flat = flatten_document(doc, &set.flatten)?;
-    let drawn = flat.as_ref().unwrap_or(doc);
+    let expanded = expand_transparent_tile_images(doc, &set.flatten)?;
+    let source = expanded.as_ref().unwrap_or(doc);
+    let transparent = source.layers.iter().any(|l| set.flatten.shows_transparency(source, l));
+    let flat = flatten_expanded(source, &set.flatten)?;
+    let drawn = flat.as_ref().unwrap_or(source);
     let mut enc = Encoded { warnings, joiner: Some("_"), ..Encoded::default() };
-    if transparent && flat.is_some() {
+    if transparent && (flat.is_some() || expanded.is_some()) {
         enc.warnings.push("transparency is flattened into opaque art and images (EPS has none): see the flattener preset".into());
     }
     let preview_limit = if saving { SAVE_PREVIEW } else { MAX_PREVIEW };
@@ -311,11 +343,18 @@ fn encode_document(doc: &Document, p: &Value, saving: bool) -> Result<Encoded> {
     let mut renderer = vectorcraft_render::Renderer::new();
     for (board, region, origin) in pages {
         let rect = vectorcraft_eps::preview_rect(region, origin);
-        let preview = match set.eps.preview {
+        let shown = match set.eps.preview {
             Preview::None => None,
             kind => Some(render(&mut renderer, doc, rect, preview_limit, set.eps.transparent_preview && kind == Preview::TiffColor)?),
         };
-        let thumbnail = set.thumbnails.then(|| render(&mut renderer, doc, rect, THUMBNAIL, false)).transpose()?;
+        // The thumbnail is made from the preview; only a file without one renders it.
+        let thumbnail = match (set.thumbnails, &shown) {
+            (false, _) => None,
+            (true, Some(img)) => Some(thumbnail_of(img, rect)?),
+            (true, None) => Some(straight(&render(&mut renderer, doc, rect, THUMBNAIL, false)?)),
+        };
+        let preview = shown.as_ref().map(straight);
+        drop(shown);
         let o = EpsOptions {
             region,
             origin,

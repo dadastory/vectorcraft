@@ -478,6 +478,11 @@ fn general(ui: &mut egui::Ui, d: &mut Dialog, editor: bool) {
     let layers = standard.allows_layers() && choice::<Compatibility>(d, "compatibility").unwrap_or_default().has_layers();
     flag(ui, d, "createLayers", tl!("Create PDF layers from layers and sublayers"), layers);
     flag(ui, d, "includeNonPrinting", tl!("Include non-printing layers"), true);
+    // PDF/X files and PDF 1.3 and 1.4 files always write long pages in points, and PDF/A files
+    // keep the `UserUnit`.
+    let compatibility = choice::<Compatibility>(d, "compatibility").unwrap_or_default();
+    let scales = standard == Standard::None && !matches!(compatibility, Compatibility::Pdf13 | Compatibility::Pdf14);
+    flag(ui, d, "longPagesInPoints", tl!("Write pages longer than 200 in at full size in points"), scales);
     if editor {
         heading(ui, tl!("Description"));
         if let Some(text) = widgets::text_field_named(ui, "pdf-preset-description", Some(tl!("Description")), Some(&d.str("description")), 460.0, 3) {
@@ -792,7 +797,7 @@ fn summary(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) {
         Ok(v) => v,
         Err(e) => {
             heading(ui, tl!("Error"));
-            ui.label(egui::RichText::new(format!("⚠ {e}")).color(t.text));
+            ui.label(egui::RichText::new(warning_line(crate::i18n::current(), &e)).color(t.text));
             return;
         }
     };
@@ -829,8 +834,13 @@ pub(super) fn warning_rows(ui: &mut egui::Ui, warnings: &[Value]) {
         note(ui, tl!("None."));
     }
     for w in warnings {
-        ui.label(egui::RichText::new(format!("⚠ {}", w.as_str().unwrap_or_default())).color(t.text));
+        ui.label(egui::RichText::new(warning_line(crate::i18n::current(), w.as_str().unwrap_or_default())).color(t.text));
     }
+}
+
+/// One of the Summary's warnings or errors, in `lang` as far as its catalog has it.
+pub(super) fn warning_line(lang: crate::i18n::Lang, w: &str) -> String {
+    format!("⚠ {}", crate::i18n::message(lang, w))
 }
 
 #[cfg(test)]

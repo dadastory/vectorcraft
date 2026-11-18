@@ -406,6 +406,90 @@ fn font_names_resolve_to_available_families() {
     assert_eq!((family.as_str(), style.as_str(), found), ("Missing Sans Pro", "Bold Italic", false));
 }
 
+/// A family can hold hyphens (`Noto-Sans-Bold` is Noto Sans, Bold): the longest part of the name
+/// before a hyphen that names an available family is the family, the rest its style. Synthetic
+/// family names, so the host's fonts don't matter.
+#[test]
+fn hyphenated_font_names_resolve_to_the_longest_available_family() {
+    let f = crate::import_text::Families::of(&["Vctest", "Vctest Sans", "Vctest Sans CJK JP", "Vctest Mono"]);
+    let ok = |family: &str, style: &str| (family.to_string(), style.to_string(), true);
+    assert_eq!(f.resolve("HUHQIP+Vctest-Sans", None, false), ok("Vctest Sans", "Regular"));
+    assert_eq!(f.resolve("Vctest-Sans-Bold", None, false), ok("Vctest Sans", "Bold"));
+    assert_eq!(f.resolve("Vctest-Sans-Italic", None, false), ok("Vctest Sans", "Italic"));
+    assert_eq!(f.resolve("Vctest-Sans", Some(700), true), ok("Vctest Sans", "Bold Italic"));
+    assert_eq!(f.resolve("Vctest-Sans-CJK-JP", None, false), ok("Vctest Sans CJK JP", "Regular"));
+    // The family is there but not the style: the family, which then draws its closest style.
+    assert_eq!(f.resolve("Vctest-Mono-Bold", None, false), ok("Vctest Mono", "Bold"));
+    // A shorter family still takes the name when no longer one is available.
+    assert_eq!(f.resolve("Vctest-BoldOblique", None, false), ok("Vctest", "Bold Oblique"));
+    assert_eq!(f.resolve("Vctest,Bold", None, false), ok("Vctest", "Bold"));
+}
+
+/// A missing font's name is split only at a comma (`Arial,Bold`) or before the first part that is
+/// a style (`Family-BoldOblique`); otherwise the whole name is the family, so the missing font is
+/// reported as `Vcmissing Sans`, not `Vcmissing`.
+#[test]
+fn a_missing_font_is_split_only_before_a_style() {
+    let f = crate::import_text::Families::of(&[]);
+    let missing = |family: &str, style: &str| (family.to_string(), style.to_string(), false);
+    assert_eq!(f.resolve("Vcmissing-Sans", None, false), missing("Vcmissing Sans", "Regular"));
+    assert_eq!(f.resolve("Vcmissing-Sans-CJK-JP", None, false), missing("Vcmissing Sans CJK JP", "Regular"));
+    assert_eq!(f.resolve("Vcmissing-Sans-BoldOblique", None, false), missing("Vcmissing Sans", "Bold Oblique"));
+    assert_eq!(f.resolve("VcmissingPro-SemiboldIt", None, false), missing("Vcmissing Pro", "Semibold It"));
+    assert_eq!(f.resolve("VcmissingPSMT-XBold", None, false), missing("Vcmissing", "XBold"));
+    assert_eq!(f.resolve("Vcmissing-Bold-SC700", None, false), missing("Vcmissing", "Bold-SC 700"));
+    assert_eq!(f.resolve("Vcmissing-Regular-Regular", None, false), missing("Vcmissing", "Regular-Regular"));
+    assert_eq!(f.resolve("Vcmissing,Bold", None, false), missing("Vcmissing", "Bold"));
+    assert_eq!(f.resolve("-Vcmissing", None, false), missing("Vcmissing", "Regular"));
+    assert_eq!(f.resolve("Vcmissing-Roman", Some(700), false), missing("Vcmissing", "Bold"));
+    assert_eq!(f.resolve("Vcmissing-", None, true), missing("Vcmissing", "Italic"));
+    assert_eq!(f.resolve("-Bold", None, false), missing("", "Bold"));
+}
+
+/// A composite (Type 0) font's base name is its CIDFont's name, a hyphen and its CMap's
+/// (`SomeFont-Italic-Identity-H`, ISO 32000-1 §9.7.6.1): the font is noted by its CIDFont's name,
+/// the PostScript name of the font program (§9.7.4.1), so it is found among the installed fonts.
+#[test]
+fn a_composite_font_is_noted_by_its_cid_font_name() {
+    let noted = |font: &str| {
+        let resources = format!("/Font << /F1 {font} >>");
+        let bytes = one_page("BT /F1 24 Tf 10 30 Td <0001> Tj ET", &resources, &[]);
+        let pdf = craft_pdf::syntax::Pdf::new(bytes).unwrap();
+        let mut fonts = crate::import_scan::FontNames::new();
+        let mut ocgs = crate::import_scan::Ocgs::read(&pdf);
+        crate::import_scan::scan_page(&pdf.pages()[0], &mut ocgs, false, &mut fonts, pdf.decode_limits().max_decoded_stream()).unwrap();
+        fonts.into_values().map(|f| f.name).collect::<Vec<_>>()
+    };
+    let type0 = |base: &str, enc: &str, descendant: &str| {
+        let info = "/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>";
+        format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /{base} /Encoding /{enc} /DescendantFonts [<< /Type /Font /Subtype /CIDFontType0 {descendant} {info} >>] >>"
+        )
+    };
+    assert_eq!(noted(&type0("MGZJFV+Vctest-Italic-Identity-H", "Identity-H", "/BaseFont /MGZJFV+Vctest-Italic")), ["MGZJFV+Vctest-Italic"]);
+    // No name in the descendant: the CMap's name comes off the end of the base name.
+    assert_eq!(noted(&type0("Vctest-Italic-UniJIS-UCS2-H", "UniJIS-UCS2-H", "")), ["Vctest-Italic"]);
+    // A base name without the CMap's is kept, as is a simple font's.
+    assert_eq!(noted(&type0("Vctest-Italic", "Identity-H", "")), ["Vctest-Italic"]);
+    assert_eq!(noted("<< /Type /Font /Subtype /Type1 /BaseFont /Vctest-Identity-H >>"), ["Vctest-Identity-H"]);
+}
+
+/// A form drawn again and again without resources of its own reads the page's font dictionary once,
+/// not at every drawing; the fonts are noted all the same.
+#[test]
+fn a_form_drawn_many_times_reads_its_font_resources_once() {
+    let form_no = first_extra(1);
+    let form = stream("/Type /XObject /Subtype /Form /BBox [0 0 100 100]", "0 0 1 rg 50 50 30 30 re f");
+    let resources = format!("/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> /XObject << /X0 {form_no} 0 R >>");
+    let page = PdfPage { resources, ..PdfPage::new(100.0, 100.0, &format!("BT /F1 24 Tf 10 30 Td (Hi) Tj ET {}", "/X0 Do ".repeat(500))) };
+    let pdf = craft_pdf::syntax::Pdf::new(pdf_with(&[page], &[&form], None)).unwrap();
+    let mut fonts = crate::import_scan::FontNames::new();
+    let mut ocgs = crate::import_scan::Ocgs::read(&pdf);
+    let walk = crate::import_scan::walk_page(&pdf.pages()[0], &mut ocgs, false, &mut fonts, pdf.decode_limits().max_decoded_stream());
+    assert_eq!(walk.font_dicts.len(), 1);
+    assert_eq!(walk.fonts.len(), 1);
+}
+
 /// A value of the page's font dictionary that the reader can't parse (a name with a broken `#`
 /// escape, a number with a stray `-`) is left out when the page's fonts are noted, and the fonts
 /// after it are noted.
@@ -614,6 +698,74 @@ fn a_function_based_shading_along_one_axis_becomes_a_linear_gradient() {
     assert_eq!(edges.len(), 8, "{:?}", g.gradient.stops);
     for (k, e) in edges.iter().take(7).enumerate() {
         assert!((e - (k + 1) as f32 / 8.0).abs() < 1e-4, "change {k} at {e}");
+    }
+}
+
+/// A function-based shading whose calculator function turns the angle about the origin into a gray
+/// ramp (`atan` gives the angle of `y` over `x` in degrees, 0 to 360, ISO 32000-1 7.10.5) comes in
+/// as a conic gradient about the origin's place on the page, turning the way the page shows it.
+#[test]
+fn a_function_based_shading_around_the_origin_becomes_a_conic_gradient() {
+    use vectorcraft_geom::Point;
+    let _held = shadings();
+    // The origin at the square's center, a unit 50 pt.
+    let r = function_shading("-1 1 -1 1", "50 0 0 50 50 50", "{ exch atan 360 div dup dup }");
+    assert!(!r.warnings.iter().any(|w| w.contains("flat")), "{:?}", r.warnings);
+    let g = all(&r.document)
+        .into_iter()
+        .find_map(|n| match n.appearance.fill().map(|f| &f.paint) {
+            Some(Paint::Gradient(g)) => Some(g.clone()),
+            _ => None,
+        })
+        .expect("a gradient fill");
+    assert_eq!(g.gradient.kind, GradientKind::Conic);
+    let geom = g.geom.unwrap();
+    assert!(geom.start.distance(Point::new(50.0, 50.0)) < 0.01, "{geom:?}");
+    // The page's y runs up, the document's down: the sweep turns counterclockwise on the page,
+    // through the top of the square a quarter turn on.
+    assert!(geom.is_mirrored(), "{geom:?}");
+    for (x, y, want) in [(90.0, 48.0, 0.0), (50.0, 10.0, 0.25), (10.0, 50.0, 0.5), (50.0, 90.0, 0.75), (90.0, 52.0, 1.0)] {
+        let gray = g.gradient.sample(geom.param_at(GradientKind::Conic, Point::new(x, y)) as f32).0.to_rgb()[0];
+        assert!((gray - want).abs() < 0.03, "({x}, {y}): {gray} vs {want}");
+    }
+}
+
+/// The same shading over a domain that leaves the origin out (the conic's center lies off the
+/// painted area) comes in as a conic gradient too, with the colors the domain shows, whether or not
+/// the seam (angle 0) runs through it.
+#[test]
+fn a_function_based_shading_beside_the_origin_becomes_a_conic_gradient() {
+    use vectorcraft_geom::Point;
+    let _held = shadings();
+    // The shading's x and y from a point of the 100 pt page (its y up, the document's down).
+    let turn = |x: f64, y: f64| {
+        let (sx, sy) = ((x - 50.0) / 50.0, (50.0 - y) / 50.0);
+        sy.atan2(sx).to_degrees().rem_euclid(360.0) / 360.0
+    };
+    for (domain, points) in [
+        // Right of the origin, across the seam.
+        ("0.2 1 -0.6 0.6", [(70.0, 30.0), (70.0, 70.0), (90.0, 45.0), (90.0, 55.0), (65.0, 25.0)]),
+        // Above it.
+        ("-1 1 0.2 1", [(50.0, 20.0), (20.0, 30.0), (80.0, 30.0), (5.0, 35.0), (95.0, 5.0)]),
+        // The origin on its left edge: the rays it shows run from straight down to straight up.
+        ("0 1 -1 1", [(52.0, 5.0), (52.0, 95.0), (90.0, 40.0), (90.0, 60.0), (75.0, 20.0)]),
+    ] {
+        let r = function_shading(domain, "50 0 0 50 50 50", "{ exch atan 360 div dup dup }");
+        let g = all(&r.document)
+            .into_iter()
+            .find_map(|n| match n.appearance.fill().map(|f| &f.paint) {
+                Some(Paint::Gradient(g)) => Some(g.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{domain}: a gradient fill, {:?}", r.warnings));
+        assert_eq!(g.gradient.kind, GradientKind::Conic, "{domain}");
+        let geom = g.geom.unwrap();
+        assert!(geom.start.distance(Point::new(50.0, 50.0)) < 0.01, "{domain}: {geom:?}");
+        for (x, y) in points {
+            let gray = g.gradient.sample(geom.param_at(GradientKind::Conic, Point::new(x, y)) as f32).0.to_rgb()[0];
+            let want = turn(x, y) as f32;
+            assert!((gray - want).abs() < 0.03, "{domain} ({x}, {y}): {gray} vs {want}");
+        }
     }
 }
 

@@ -93,7 +93,7 @@ fn matches(name: &str, target: &str) -> bool {
 }
 
 /// `2026-10-08T07:59:17.728Z` (UTC, milliseconds). A clock before 1970 reads as the epoch.
-/// A clock far past chrono's year range still converts (the calendar repeats every 400 years), so
+/// A clock far past time's year range still converts (the calendar repeats every 400 years), so
 /// logging never panics and never silently resets to the epoch for a convertible instant.
 pub fn timestamp(t: SystemTime) -> String {
     let since = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
@@ -102,26 +102,30 @@ pub fn timestamp(t: SystemTime) -> String {
     let secs = i64::try_from(since.as_secs()).unwrap_or(i64::MAX);
     let (y, t) = utc_parts(secs, since.subsec_nanos());
     // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
-    format!("{y:04}-{}", t.format("%m-%dT%H:%M:%S%.3fZ"))
+    format!(
+        "{y:04}-{}",
+        t.format(time::macros::format_description!("[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z")).unwrap_or_default()
+    )
 }
 
 /// Unix seconds (+ nanos) → (proleptic Gregorian year, the same wall-clock instant moved into
-/// chrono's range by whole 400-year cycles). The calendar repeats every 400 years (146_097 days),
-/// so month, day and time of day come from chrono and only the year is carried, which keeps every
-/// `i64` exact. Replaces the old hand-rolled `civil_from_days`; chrono is the only calendar logic.
-fn utc_parts(secs: i64, nanos: u32) -> (i64, chrono::NaiveDateTime) {
-    use chrono::Datelike;
+/// time's range by whole 400-year cycles). The calendar repeats every 400 years (146_097 days),
+/// so month, day and time of day come from time and only the year is carried, which keeps every
+/// `i64` exact. Replaces the old hand-rolled `civil_from_days`; time is the only calendar logic.
+fn utc_parts(secs: i64, nanos: u32) -> (i64, time::PrimitiveDateTime) {
     let (days, sod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     let (cycles, rest) = (days.div_euclid(146_097), days.rem_euclid(146_097));
     // `rest + 719_163` (1970-01-01 is CE day 719_163) is always a valid CE day, and `sod` < 86_400.
-    let date = i32::try_from(rest + 719_163).ok().and_then(chrono::NaiveDate::from_num_days_from_ce_opt);
-    let time = u32::try_from(sod).ok().and_then(|s| chrono::NaiveTime::from_num_seconds_from_midnight_opt(s, nanos.min(999_999_999)));
+    let date = i32::try_from(rest + 719_163).ok().and_then(|day| time::Date::from_julian_day(day + 1_721_425).ok());
+    let time = u32::try_from(sod)
+        .ok()
+        .and_then(|s| time::Time::from_hms_nano((s / 3600) as u8, (s / 60 % 60) as u8, (s % 60) as u8, nanos.min(999_999_999)).ok());
     match (date, time) {
         (Some(d), Some(t)) => {
             let y = i128::from(d.year()) + i128::from(cycles) * 400;
-            (i64::try_from(y).unwrap_or(if y < 0 { i64::MIN } else { i64::MAX }), d.and_time(t))
+            (i64::try_from(y).unwrap_or(if y < 0 { i64::MIN } else { i64::MAX }), d.with_time(t))
         }
-        _ => (1970, chrono::NaiveDateTime::default()), // unreachable
+        _ => (1970, time::macros::datetime!(1970-01-01 0:00)), // unreachable
     }
 }
 

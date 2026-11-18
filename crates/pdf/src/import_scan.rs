@@ -455,12 +455,15 @@ fn blank_tail(mut bytes: &[u8]) -> bool {
     }
 }
 
-struct Walker<'w, 'p> {
+pub(crate) struct Walker<'w, 'p> {
     ocgs: &'w mut Ocgs,
     /// The groups that are off for the interpreter (none once [`all_on`] turned them on).
     off: HashSet<ObjectIdentifier>,
     xref: &'p craft_pdf::syntax::xref::XRef,
-    fonts: &'w mut FontNames,
+    pub(crate) fonts: &'w mut FontNames,
+    /// The font dictionaries ([`Dict::cache_key`]) whose fonts were noted: a form drawn again with
+    /// the same resources isn't read for its fonts again.
+    pub(crate) font_dicts: HashSet<u128>,
     visible: Vec<bool>,
     ops: usize,
     max_ops: usize,
@@ -632,13 +635,16 @@ impl Walker<'_, '_> {
     }
 
     fn note_fonts(&mut self, res: &Resources<'_>) {
+        if !self.font_dicts.insert(res.fonts.cache_key()) {
+            return;
+        }
         for key in res.fonts.keys() {
             if let Some(f) = res.fonts.get::<Dict<'_>>(key.as_ref())
-                && let Some(name) = f.get::<Name<'_>>(b"BaseFont")
+                && let Some(name) = font_name(&f)
             {
                 self.fonts.entry(f.cache_key()).or_insert_with(|| {
                     let embedded = embeds_glyphs(&f);
-                    FontNote { name: String::from_utf8_lossy(name.as_ref()).into_owned(), embedded, vertical: vertical_metrics(&f, embedded) }
+                    FontNote { name, embedded, vertical: vertical_metrics(&f, embedded) }
                 });
             }
         }
@@ -1009,6 +1015,24 @@ fn cid_ranges(a: &Array<'_>, per: usize, mut each: impl FnMut(u32, &[f64])) {
     }
 }
 
+/// The PostScript name of font `f`: its `BaseFont`. A composite (Type 0) font's `BaseFont` is its
+/// CIDFont's name, a hyphen and its CMap's (`Name-Identity-H`, ISO 32000-1 §9.7.6.1), so its
+/// descendant CIDFont's `BaseFont` is taken, the font program's own name (§9.7.4.1); without one,
+/// the `BaseFont` without the CMap's name on its end.
+fn font_name(f: &Dict<'_>) -> Option<String> {
+    let base = String::from_utf8_lossy(f.get::<Name<'_>>(b"BaseFont")?.as_ref()).into_owned();
+    if f.get::<Name<'_>>(b"Subtype").is_none_or(|s| s.as_ref() != b"Type0") {
+        return Some(base);
+    }
+    let descendant = f.get::<Array<'_>>(b"DescendantFonts").and_then(|a| a.iter::<Dict<'_>>().next());
+    if let Some(name) = descendant.and_then(|d| d.get::<Name<'_>>(b"BaseFont")).filter(|n| !n.as_ref().is_empty()) {
+        return Some(String::from_utf8_lossy(name.as_ref()).into_owned());
+    }
+    let cmap = f.get::<Name<'_>>(b"Encoding").map(|n| String::from_utf8_lossy(n.as_ref()).into_owned());
+    let stripped = cmap.and_then(|c| base.strip_suffix(c.as_str())?.strip_suffix('-').filter(|b| !b.is_empty()).map(str::to_string));
+    Some(stripped.unwrap_or(base))
+}
+
 /// Whether font `f` carries its own glyphs: a font program in its descriptor (a composite font's in
 /// its descendant's), or a Type 3 font's glyph procedures. A font that doesn't is drawn with a
 /// stand-in, whose glyphs say nothing about which installed face the document means.
@@ -1031,13 +1055,20 @@ pub(crate) fn scan_page(page: &Page<'_>, ocgs: &mut Ocgs, all_on: bool, fonts: &
     if scan.cut { Err(incomplete_content()) } else { Ok(scan) }
 }
 
-fn walk_page<'w, 'p>(page: &Page<'p>, ocgs: &'w mut Ocgs, all_on: bool, fonts: &'w mut FontNames, max_form_bytes: usize) -> Walker<'w, 'p> {
+pub(crate) fn walk_page<'w, 'p>(
+    page: &Page<'p>,
+    ocgs: &'w mut Ocgs,
+    all_on: bool,
+    fonts: &'w mut FontNames,
+    max_form_bytes: usize,
+) -> Walker<'w, 'p> {
     let off = if all_on { HashSet::new() } else { ocgs.off.clone() };
     let mut w = Walker {
         ocgs,
         off,
         xref: page.xref(),
         fonts,
+        font_dicts: HashSet::new(),
         visible: vec![],
         ops: 0,
         max_ops: max_ops(),

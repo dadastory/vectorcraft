@@ -3,6 +3,35 @@ use super::*;
 
 const ZH: fn() -> Lang = || Lang::from_code("zh-hant").expect("zh-hant registered");
 
+#[test]
+fn hindi_resolves_locales_and_uses_zero_one_plurals() {
+    let hi = Lang::from_code("hi").expect("hi registered");
+    for tag in ["hi", "hi-IN", "hi_IN.UTF-8", "HI-in", "hi-Deva-IN"] {
+        assert_eq!(lang_from_tag(tag), Some(hi), "{tag}");
+    }
+    assert_eq!(hi.name(), "हिन्दी");
+    assert_eq!([0, 1, 2, 21, u64::MAX].map(hi.0.plural), [0, 0, 1, 1, 1]);
+    assert_eq!(tr(hi, "Save"), "सेव");
+    assert_eq!(tr(hi, "Save As…"), "सेव ऐज़…");
+    assert_eq!(tr(hi, "Path"), "पाथ");
+    assert_eq!(tr(hi, "Selection"), "सिलेक्शन");
+    assert_eq!(tr(hi, "Properties"), "प्रॉपर्टीज़");
+    assert_eq!(tr(hi, "Options"), "ऑप्शन्स");
+    assert_eq!(tr(hi, "Open"), "ओपन");
+    let (entries, errors) = parse_entries(hi.0.source);
+    assert!(errors.is_empty(), "{errors:?}");
+    for (ctx, src, translation) in entries.iter().filter(|(ctx, _, _)| ctx == "@plural" || ctx == "@msgplural") {
+        let (one, other) = src.split_once('|').expect("one|other source");
+        let forms: Vec<_> = translation.split('|').collect();
+        assert_eq!(forms.len(), 2, "{ctx}: {src}");
+        if ctx == "@plural" {
+            for (n, index) in [(0, 0), (1, 0), (2, 1), (21, 1)] {
+                assert_eq!(trn(hi, n, one, other), forms[index].replace("{n}", &n.to_string()));
+            }
+        }
+    }
+}
+
 /// Locale tags name their language by region or script (in either case, with an encoding or
 /// modifier), and a tag that names no language resolves to none.
 #[test]
@@ -144,6 +173,71 @@ fn catalan_reads_as_catalan() {
     assert_eq!(message(ca, nested), "l’ordre `object.group` no està disponible ara mateix: no hi ha res seleccionat");
 }
 
+#[test]
+fn font_height_reference_labels_are_in_complete_catalogs() {
+    for lang in LANGUAGES.iter().filter(|lang| lang.complete_menus) {
+        for label in
+            ["Show Font Height Options", "Hide Font Height Options", "Set Font Height Reference", "Em Box", "Cap Height", "x-Height", "ICF Box"]
+        {
+            assert!(lang.catalog().plain(label).is_some(), "{} is missing {label}", lang.code);
+        }
+    }
+}
+
+/// Preference choices and the marquee's E hint share the same translated labels.
+#[test]
+fn marquee_selection_labels_are_in_complete_catalogs() {
+    for lang in LANGUAGES.iter().filter(|lang| lang.complete_menus) {
+        for label in ["Marquee Selection", "Touching", "Fully Enclosed", "Drag Direction"] {
+            assert!(lang.catalog().plain(label).is_some(), "{} is missing {label}", lang.code);
+        }
+    }
+}
+
+/// The Control bar panel menu's items, its groups of options and the edges, and the label of the
+/// command that turns a group on or off.
+#[test]
+fn control_bar_panel_menu_labels_are_in_complete_catalogs() {
+    const LABELS: [&str; 18] = [
+        "Snapping",
+        "Anchor Points",
+        "Tool Options",
+        "Object Options",
+        "Image Options",
+        "Fill and Stroke",
+        "Opacity",
+        "Graphic Style",
+        "Character",
+        "Paragraph",
+        "Vertical Alignment",
+        "Align and Distribute",
+        "Transform",
+        "Artboard Options",
+        "Document Options",
+        "Dock to Top",
+        "Dock to Bottom",
+        "Control Bar Options",
+    ];
+    for lang in LANGUAGES.iter().filter(|lang| lang.complete_menus) {
+        for label in LABELS {
+            assert!(lang.catalog().plain(label).is_some(), "{} is missing {label}", lang.code);
+        }
+    }
+}
+
+/// The Character panel's Anti-aliasing Method label and its choices, with the Sharp method's
+/// own `antiAlias` row apart from the plain "Sharp" corner row.
+#[test]
+fn anti_aliasing_method_labels_are_in_complete_catalogs() {
+    for lang in LANGUAGES.iter().filter(|lang| lang.complete_menus) {
+        let cat = lang.catalog();
+        for label in ["Anti-aliasing Method", "Crisp", "Strong"] {
+            assert!(cat.plain(label).is_some(), "{} is missing {label}", lang.code);
+        }
+        assert!(cat.contextual("antiAlias", "Sharp").is_some(), "{} is missing the antiAlias Sharp row", lang.code);
+    }
+}
+
 /// Each language counts with its own plural rule: the form a count picks (`one`, then `few`, then
 /// `other`/`many`).
 #[test]
@@ -162,6 +256,24 @@ fn each_language_counts_with_its_plural_rule() {
             assert_eq!(COUNTS.map(rule), forms, "{code}");
         }
     }
+}
+
+/// The Script Console's counted phrases have a row in every complete catalog, and a count picks
+/// the language's own form.
+#[test]
+fn script_console_counts_take_each_language_s_form() {
+    const COUNTED: [(&str, &str); 3] =
+        [("{n} host call", "{n} host calls"), ("{n} earlier line dropped", "{n} earlier lines dropped"), ("{n} line cut", "{n} lines cut")];
+    for l in LANGUAGES.iter().filter(|l| l.complete_menus) {
+        for (one, other) in COUNTED {
+            assert!(l.catalog().plural(one, other, 0).is_some(), "{} is missing the row for {other}", l.code);
+        }
+    }
+    assert_eq!([1, 2].map(|n| trn(de(), n, COUNTED[0].0, COUNTED[0].1)), ["1 Host-Aufruf", "2 Host-Aufrufe"]);
+    let ru = Lang::from_code("ru").expect("registered");
+    assert_eq!([1, 3, 5].map(|n| trn(ru, n, COUNTED[2].0, COUNTED[2].1)), ["1 строка обрезана", "3 строки обрезаны", "5 строк обрезано"]);
+    let fr = Lang::from_code("fr").expect("registered");
+    assert_eq!([0, 1].map(|n| trn(fr, n, COUNTED[1].0, COUNTED[1].1)), ["0 ligne antérieure supprimée", "1 ligne antérieure supprimée"]);
 }
 
 #[test]
@@ -271,7 +383,7 @@ fn bundled_catalogs_are_consistent() {
         let mut seen = std::collections::HashSet::new();
         for (ctx, src, tr) in &entries {
             assert!(seen.insert((ctx.clone(), src.clone())), "{}: duplicate {ctx:?} {src:?}", l.code);
-            if ctx == "@plural" {
+            if ctx == "@plural" || ctx == "@msgplural" {
                 let one_other: Vec<&str> = src.split('|').collect();
                 assert_eq!(one_other.len(), 2, "{}: plural source must be `one|other`: {src:?}", l.code);
                 for form in tr.split('|') {
@@ -393,6 +505,11 @@ fn is_georgian(c: char) -> bool {
     matches!(c as u32, 0x10A0..=0x10FF | 0x1C90..=0x1CBF | 0x2D00..=0x2D2F)
 }
 
+#[cfg(feature = "interface-fonts")]
+fn is_devanagari(c: char) -> bool {
+    matches!(c as u32, 0x0900..=0x097F | 0x1CD0..=0x1CFF | 0xA8E0..=0xA8FF)
+}
+
 /// The UI fonts draw every character the catalogs use, in every family the UI draws text with
 /// (the web build has no system fonts to fall back to). Chinese and Japanese characters come from
 /// the craft-fonts build input, which is optional: without it they are left to the installed
@@ -405,6 +522,7 @@ fn is_georgian(c: char) -> bool {
 fn bundled_fonts_cover_the_catalogs() {
     let japanese_ui_font = vectorcraft_text::CRAFT_FONTS.iter().any(|f| f.is_japanese());
     let georgian_ui_font = vectorcraft_text::CRAFT_FONTS.iter().any(|f| f.is_georgian());
+    let devanagari_ui_font = vectorcraft_text::CRAFT_FONTS.iter().any(|f| f.scripts.contains(&"Deva"));
     let ctx = egui::Context::default();
     crate::theme::install_fonts(&ctx);
     let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
@@ -423,7 +541,12 @@ fn bundled_fonts_cover_the_catalogs() {
             let chars: std::collections::BTreeSet<char> = entries
                 .iter()
                 .flat_map(|(_, _, tr)| tr.chars())
-                .filter(|c| !c.is_whitespace() && (cjk_checked || !is_cjk(*c)) && (georgian_ui_font || !is_georgian(*c)))
+                .filter(|c| {
+                    !c.is_whitespace()
+                        && (cjk_checked || !is_cjk(*c))
+                        && (georgian_ui_font || !is_georgian(*c))
+                        && (devanagari_ui_font || !is_devanagari(*c))
+                })
                 .collect();
             for family in &families {
                 let font = egui::FontId::new(13.0, family.clone());
@@ -513,9 +636,36 @@ fn zh_hans_is_simplified_and_mainland() {
     assert!(bad.is_empty(), "in zh-hans.tsv:\n{}", bad.join("\n"));
 }
 
+/// Whether `text` holds `term`. In a script that separates words with spaces the term must stand as
+/// whole words, so "liderlik" does not hold "lider"; in Chinese, Japanese, Thai, Lao, Khmer and
+/// Myanmar text any occurrence counts.
+fn contains_term(text: &str, term: &str) -> bool {
+    let unspaced = |c: char| matches!(c as u32, 0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1780..=0x17FF | 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF);
+    if term.chars().any(unspaced) {
+        return text.contains(term);
+    }
+    text.match_indices(term).any(|(at, m)| {
+        !text[..at].chars().next_back().is_some_and(char::is_alphanumeric) && !text[at + m.len()..].chars().next().is_some_and(char::is_alphanumeric)
+    })
+}
+
+#[test]
+fn contains_term_matches_whole_words_where_words_are_spaced() {
+    assert!(contains_term("tepeden tepeye lider", "lider"));
+    assert!(contains_term("boyut/lider:", "lider"));
+    assert!(contains_term("réinitialiser l’approche", "approche"));
+    assert!(!contains_term("tepeden tepeye liderlik", "lider"));
+    assert!(!contains_term("automatické proklady:", "proklad"));
+    assert!(contains_term("kích thước: giãn chữ:", "giãn chữ"));
+    assert!(!contains_term("kích thước chữ: giãn:", "giãn chữ"));
+    assert!(contains_term("自動行送り:", "行送り"));
+    assert!(contains_term("大小：字距微調：", "字距"));
+}
+
 /// Each catalog names leading with one term: every word of the Character panel's Leading field
-/// (the text before " (", ignoring case) appears in the Auto Leading, Size/Leading, Top-to-Top
-/// Leading and Bottom-to-Bottom Leading rows outside their placeholders.
+/// (the text before " (", ignoring case) appears as a whole word (see [`contains_term`]) in the
+/// Auto Leading, Size/Leading, Top-to-Top Leading and Bottom-to-Bottom Leading rows outside their
+/// placeholders.
 /// A catalog without the Leading row, or without one of the others, is skipped for that check.
 #[test]
 fn leading_term_agrees_within_each_catalog() {
@@ -529,7 +679,7 @@ fn leading_term_agrees_within_each_catalog() {
         for src in ["Auto Leading:", "Size/Leading", "Top-to-Top Leading", "Bottom-to-Bottom Leading"] {
             if let Some(text) = row(src) {
                 let bare = placeholders(&text).iter().fold(text.clone(), |t, p| t.replace(&format!("{{{p}}}"), " "));
-                for word in leading.split_whitespace().filter(|w| !bare.contains(*w)) {
+                for word in leading.split_whitespace().filter(|w| !contains_term(&bare, w)) {
                     bad.push(format!("{}: {src:?} → {text:?} lacks {word:?} from the Leading field {leading:?}", l.code));
                 }
             }
@@ -565,10 +715,12 @@ fn no_translated_word_mixes_latin_cyrillic_and_greek_letters() {
 }
 
 /// Each catalog gives the Character panel's Kerning, Leading and Tracking fields three different
-/// names, every word of the Tracking and Kerning names appears in the Reset Tracking and Kerning
-/// row, and every word of the Tracking name appears in the Info panel's type line outside its
-/// placeholders (ignoring case). Each word is matched once, the longer name first, so a name
-/// that contains the other name does not count for both.
+/// names, and every word of the Tracking and Kerning names appears in the Reset Tracking and
+/// Kerning row (ignoring case). Each word is matched once, the longer name first, so a name that
+/// contains the other name does not count for both. The Info panel's type line labels
+/// `{tracking}` with the whole Tracking name: the text between the placeholder before it and
+/// `{tracking}` holds the name (see [`contains_term`]) once any Kerning or Leading name that
+/// contains it has been taken out.
 /// A catalog without one of these rows is skipped for the checks that need it.
 #[test]
 fn character_panel_terms_agree_within_each_catalog() {
@@ -576,7 +728,7 @@ fn character_panel_terms_agree_within_each_catalog() {
     for l in LANGUAGES.iter().filter(|l| !l.source.is_empty()) {
         let (entries, _) = parse_entries(l.source);
         let row = |src: &str| entries.iter().find(|(ctx, s, _)| ctx.is_empty() && s == src).map(|(_, _, tr)| tr.to_lowercase());
-        let kerning = row("Kerning (0 = Auto)").map(|tr| tr.split(" (").next().unwrap_or_default().trim().to_string());
+        let kerning = row("Kerning");
         let leading = row("Leading");
         let tracking = row("Tracking");
         for (a, b) in [(&kerning, &leading), (&kerning, &tracking), (&leading, &tracking)] {
@@ -602,7 +754,16 @@ fn character_panel_terms_agree_within_each_catalog() {
             }
         };
         uses("Reset Tracking and Kerning", &[&tracking, &kerning]);
-        uses("Size: {size}  Tracking: {tracking}", &[&tracking]);
+        if let (Some(text), Some(tracking)) = (row("Size: {size}  Tracking: {tracking}"), &tracking) {
+            let before = text.split("{tracking}").next().unwrap_or_default();
+            let mut label = before.rsplit('}').next().unwrap_or_default().to_string();
+            for other in [&kerning, &leading].into_iter().flatten().filter(|o| *o != tracking && o.contains(tracking.as_str())) {
+                label = label.replace(other.as_str(), " ");
+            }
+            if !contains_term(&label, tracking) {
+                bad.push(format!("{}: the Info row {text:?} labels {{tracking}} {label:?}, not the field {tracking:?}", l.code));
+            }
+        }
     }
     assert!(bad.is_empty(), "Character panel terms that disagree:\n{}", bad.join("\n"));
 }
@@ -1033,8 +1194,8 @@ fn cs() -> Lang {
 }
 
 /// Languages whose catalogs leave [`MENU_KEEP_AS_IS`] in English.
-const KEEPS_MENU_NAMES: [&str; 19] =
-    ["cs", "de", "el", "es", "fr", "hu", "it", "ja", "ka", "ko", "pl", "pt-br", "ru", "sv", "uk", "vi", "fi", "tr", "ca"];
+const KEEPS_MENU_NAMES: [&str; 20] =
+    ["cs", "de", "el", "es", "fr", "hi", "hu", "it", "ja", "ka", "ko", "pl", "pt-br", "ru", "sv", "uk", "vi", "fi", "tr", "ca"];
 
 /// Menu labels the menu-complete catalogs (Czech, German, Spanish, Italian, Japanese, Brazilian Portuguese) show as they are: the product name, a format name, the built-in workspace
 /// names and the perspective grid presets (names, shown untranslated wherever else they appear).
@@ -1485,6 +1646,28 @@ fn messages_translate_by_template_and_their_parts() {
     assert_eq!(message(Lang::EN, nested), nested);
 }
 
+/// The note `recolor.apply` and the Edit Colors commands give when they leave out locked or hidden
+/// objects is translated whole, its counts included, in every complete-message language.
+#[test]
+fn recolor_notes_on_objects_left_unchanged_translate_with_their_counts() {
+    let notes = [
+        ("Recolor completed; 2 locked objects and 1 hidden object were left unchanged", ["2", "1"]),
+        ("Recolor completed; 1 locked object and 3 hidden objects were left unchanged", ["1", "3"]),
+        ("Recolor completed; 1 locked object was left unchanged", ["1", "1"]),
+        ("Recolor completed; 5 hidden objects were left unchanged", ["5", "5"]),
+    ];
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        for (note, counts) in notes {
+            let shown = message(lang, note);
+            // Whole words, so that a translation such as Catalan's "objecte" is not read as English.
+            let english = ["completed", "locked", "hidden", "object", "objects", "unchanged"];
+            assert!(shown.split(|c: char| !c.is_alphabetic()).all(|w| !english.contains(&w)), "{code}: {shown}");
+            assert!(counts.iter().all(|n| shown.contains(n)), "{code}: {shown}");
+        }
+    }
+}
+
 #[test]
 fn package_status_message_templates_parse() {
     let c = Catalog::parse(concat!(
@@ -1498,6 +1681,189 @@ fn package_status_message_templates_parse() {
     assert!(c.message("2 file(s) in /tmp/foo. Show the package folder?").is_some());
     assert!(c.message("2 file(s) in /tmp/foo (1 linked file(s) not found). Show the package folder?").is_some());
     assert!(Catalog::parse("@msg\tPackaged {n} file(s) in {folder}{note}\tbad\n").message("Packaged 1 file(s) in /a b").is_none());
+}
+
+/// A `@msgplural` row translates both English forms of a message with a count, and the count
+/// picks the language's form.
+#[test]
+fn messages_with_a_count_take_the_plural_form() {
+    let c = Catalog::parse("@msgplural\tSaved {n} file|Saved {n} files\tone {n}|few {n}|many {n}\n");
+    for s in ["Saved 1 file", "Saved 4 files"] {
+        let (forms, caps) = c.message_forms(s).unwrap();
+        assert_eq!(forms, ["one {n}", "few {n}", "many {n}"], "{s}");
+        assert_eq!(caps.len(), 1, "{s}");
+    }
+    assert!(c.message_forms("Saved 1 files!").is_none());
+    let cs = cs();
+    assert_eq!(message(cs, "Packaged 1 file"), "Zabalen 1 soubor");
+    assert_eq!(message(cs, "Packaged 4 files"), "Zabaleny 4 soubory");
+    assert_eq!(message(cs, "Packaged 21 files"), "Zabaleno 21 souborů");
+}
+
+/// The import's note for warped type that opened as drawn art is translated in every complete
+/// catalog. It is built from a constant, which the scan of message literals doesn't see.
+#[test]
+fn warped_type_note_is_translated() {
+    let note = "warped text objects that came in as drawn art, not as editable type: 3";
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        let shown = message(lang, note);
+        assert_ne!(shown, note, "{code}");
+        assert!(shown.contains('3'), "{code}: {shown}");
+    }
+}
+
+/// The Gamut Check status line names a count of 1 in the singular and other counts in the plural,
+/// and every complete catalog translates it, in the form its plural rule picks.
+#[test]
+fn gamut_check_status_takes_the_plural_form() {
+    use crate::panels::separations::gamut_check_status;
+    assert_eq!(gamut_check_status(0), "All colors are within the CMYK gamut");
+    assert_eq!(gamut_check_status(1), "1 color is out of the CMYK gamut");
+    assert_eq!(gamut_check_status(3), "3 colors are out of the CMYK gamut");
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        for n in [0, 1, 3] {
+            let s = gamut_check_status(n);
+            assert_ne!(message(lang, &s), s, "{code}: {s}");
+        }
+    }
+    assert_eq!(message(de(), &gamut_check_status(1)), "1 Farbe liegt außerhalb des CMYK-Farbumfangs");
+    assert_eq!(message(de(), &gamut_check_status(3)), "3 Farben liegen außerhalb des CMYK-Farbumfangs");
+    let cs = cs();
+    assert_eq!(message(cs, &gamut_check_status(1)), "1 barva je mimo gamut CMYK");
+    assert_eq!(message(cs, &gamut_check_status(3)), "3 barvy jsou mimo gamut CMYK");
+    assert_eq!(message(cs, &gamut_check_status(5)), "5 barev je mimo gamut CMYK");
+}
+
+/// The link, font and export status messages with a count, in English for a count of 1 and of 2.
+const COUNTED_STATUS_MESSAGES: &[(&str, &str)] = &[
+    ("1 linked file can't be read here: its preview shows", "2 linked files can't be read here: their previews show"),
+    ("1 image couldn't be decoded and shows as a crossed box", "2 images couldn't be decoded and show as crossed boxes"),
+    ("1 linked image changed on disk: Update Links shows the new version", "2 linked images changed on disk: Update Links shows the new versions"),
+    ("Updated 1 linked file changed on disk", "Updated 2 linked files changed on disk"),
+    ("Exported /out/a.svg with 1 note: a note", "Exported /out/a.svg with 2 notes: a note"),
+    ("Embedded 1 image; 1 missing: relink them first", "Embedded 2 images; 1 missing: relink them first"),
+    ("Embedded 1 image", "Embedded 2 images"),
+    ("Relinked 1 image", "Relinked 2 images"),
+    ("Relinked 1 image; not in that folder: a.png", "Relinked 2 images; not in that folder: a.png"),
+    ("Relinked 1 image; a.png couldn't be relinked: a reason", "Relinked 2 images; a.png couldn't be relinked: a reason"),
+    ("Updated 1 image", "Updated 2 images"),
+    ("Replaced 1 image", "Replaced 2 images"),
+    ("Broke 1 link", "Broke 2 links"),
+    ("Broke 1 link; 1 can't be read: relink or update them first", "Broke 2 links; 1 can't be read: relink or update them first"),
+    ("1 font file is now in /fonts", "2 font files are now in /fonts"),
+    ("1 font file is now in /fonts; 1 couldn't be added: a reason", "2 font files are now in /fonts; 1 couldn't be added: a reason"),
+    ("1 font isn't available here: its text shows in another font", "2 fonts aren't available here: their text shows in another font"),
+    ("Copied the CSS of 1 object", "Copied the CSS of 2 objects"),
+    ("Downloaded 1 file", "Downloaded 2 files"),
+    ("Exported 1 file to /out", "Exported 2 files to /out"),
+    ("Loaded “Tidy”: 1 step was left out", "Loaded “Tidy”: 2 steps were left out"),
+];
+
+/// The link, font, export and action set status messages name a count of 1 in the singular and other counts in
+/// the plural, and every complete catalog translates both, in the form its plural rule picks.
+#[test]
+fn counted_status_messages_take_the_plural_form() {
+    use crate::panels::links::{relinked_status, updated_status};
+    assert_eq!((relinked_status(1), relinked_status(2)), ("Relinked 1 image".to_string(), "Relinked 2 images".to_string()));
+    assert_eq!((updated_status(1), updated_status(2)), ("Updated 1 image".to_string(), "Updated 2 images".to_string()));
+    assert_eq!(crate::dialogs::missing_links::changed_on_disk_status(1), COUNTED_STATUS_MESSAGES[2].0);
+    assert_eq!(crate::dialogs::missing_links::changed_on_disk_status(2), COUNTED_STATUS_MESSAGES[2].1);
+    assert_eq!(crate::io::exported_with_notes("/out/a.svg", 1, "a note"), COUNTED_STATUS_MESSAGES[4].0);
+    assert_eq!(crate::io::exported_with_notes("/out/a.svg", 2, "a note"), COUNTED_STATUS_MESSAGES[4].1);
+    // A value that holds placeholder text is not filled in again.
+    assert_eq!(crate::io::exported_with_notes("/out/{first}.svg", 1, "{n}"), "Exported /out/{first}.svg with 1 note: {n}");
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        for s in COUNTED_STATUS_MESSAGES.iter().flat_map(|(one, other)| [one, other]) {
+            assert_ne!(message(lang, s), *s, "{code}: {s}");
+        }
+    }
+    let cs = cs();
+    assert_eq!(message(cs, &relinked_status(1)), "Znovu propojen 1 obrázek");
+    assert_eq!(message(cs, &relinked_status(3)), "Znovu propojeny 3 obrázky");
+    assert_eq!(message(cs, &relinked_status(5)), "Znovu propojeno 5 obrázků");
+    assert_eq!(message(de(), &updated_status(1)), "1 Bild aktualisiert");
+    assert_eq!(message(de(), &updated_status(2)), "2 Bilder aktualisiert");
+    let noted = crate::io::exported_with_notes("/out/{n}.svg", 1, "{what}");
+    assert_eq!(message(de(), &noted), "/out/{n}.svg mit 1 Hinweis exportiert: {what}");
+    let ru = Lang::from_code("ru").expect("registered");
+    assert_eq!(message(ru, COUNTED_STATUS_MESSAGES[19].0), "Экспортирован 1 файл в /out");
+    assert_eq!(message(ru, "Exported 3 files to /out"), "Экспортировано 3 файла в /out");
+    assert_eq!(message(ru, "Exported 5 files to /out"), "Экспортировано 5 файлов в /out");
+}
+
+/// The open, save and recovery status messages with a count, in English for a count of 1 and of 2.
+const OPEN_SAVE_COUNTED_MESSAGES: &[(&str, &str)] = &[
+    ("Opened with 1 note: a note", "Opened with 2 notes: a note"),
+    ("Saved /out/a.pdf with 1 note: a note", "Saved /out/a.pdf with 2 notes: a note"),
+    ("Discarded 1 recovered document", "Discarded 2 recovered documents"),
+    ("Restored 1 recovered document: save it to keep it", "Restored 2 recovered documents: save them to keep them"),
+];
+
+/// The open, save and recovery status messages and the Global Edit options' Results line name a
+/// count of 1 in the singular and other counts in the plural, and every complete catalog
+/// translates both, in the form its plural rule picks.
+#[test]
+fn open_save_and_recovery_messages_take_the_plural_form() {
+    use crate::io::{opened_with_notes, saved_status};
+    use crate::panels::properties::global_edit_results;
+    use crate::recovery::recovered_status;
+    let saved = |path: &str, n: usize| saved_status(path, &serde_json::json!({ "warnings": vec!["a note"; n] }));
+    let made = [
+        (opened_with_notes(1, "a note"), opened_with_notes(2, "a note")),
+        (saved("/out/a.pdf", 1), saved("/out/a.pdf", 2)),
+        (recovered_status(true, 1), recovered_status(true, 2)),
+        (recovered_status(false, 1), recovered_status(false, 2)),
+    ];
+    for ((one, other), (want_one, want_other)) in made.iter().zip(OPEN_SAVE_COUNTED_MESSAGES) {
+        assert_eq!((one.as_str(), other.as_str()), (*want_one, *want_other));
+    }
+    // A path that holds placeholder text is not filled in again.
+    assert_eq!(saved("/out/{first}.pdf", 1), "Saved /out/{first}.pdf with 1 note: a note");
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        for s in OPEN_SAVE_COUNTED_MESSAGES.iter().flat_map(|(one, other)| [one, other]) {
+            assert_ne!(message(lang, s), *s, "{code}: {s}");
+        }
+    }
+    for l in LANGUAGES.iter().filter(|l| l.complete_menus) {
+        let lang = Lang::from_code(l.code).expect("registered");
+        for n in [1, 2] {
+            assert_ne!(trn(lang, n, "Result: {n}", "Results: {n}"), trn(Lang::EN, n, "Result: {n}", "Results: {n}"), "{}: {n}", l.code);
+        }
+    }
+    assert_eq!((global_edit_results(1), global_edit_results(2)), ("Result: 1".to_string(), "Results: 2".to_string()));
+    set_current(de());
+    assert_eq!((global_edit_results(1), global_edit_results(2)), ("Ergebnis: 1".to_string(), "Ergebnisse: 2".to_string()));
+    set_current(Lang::EN);
+    assert_eq!(message(de(), OPEN_SAVE_COUNTED_MESSAGES[0].0), "Mit 1 Hinweis geöffnet: a note");
+    assert_eq!(message(de(), OPEN_SAVE_COUNTED_MESSAGES[0].1), "Mit 2 Hinweisen geöffnet: a note");
+    assert_eq!(message(de(), &saved("/out/{n}.pdf", 2)), "/out/{n}.pdf mit 2 Hinweisen gespeichert: a note");
+    let cs = cs();
+    assert_eq!(message(cs, &recovered_status(true, 1)), "Zahozen 1 obnovený dokument");
+    assert_eq!(message(cs, &recovered_status(true, 3)), "Zahozeny 3 obnovené dokumenty");
+    assert_eq!(message(cs, &recovered_status(true, 5)), "Zahozeno 5 obnovených dokumentů");
+    let ru = Lang::from_code("ru").expect("registered");
+    assert_eq!(message(ru, &opened_with_notes(1, "x")), "Открыто с 1 примечанием: x");
+    assert_eq!(message(ru, &opened_with_notes(3, "x")), "Открыто с 3 примечаниями: x");
+}
+
+/// The `{n}` of a message with a count matches only a number, so a path that holds the text after
+/// the path keeps its count and its whole path. A `{n}` in a message without a count is any text.
+#[test]
+fn a_count_placeholder_matches_only_a_number() {
+    use crate::io::saved_status;
+    let saved = |path: &str, n: usize| saved_status(path, &serde_json::json!({ "warnings": vec!["a note"; n] }));
+    let path = "/out/art with notes.pdf";
+    assert_eq!(message(de(), &saved(path, 1)), "/out/art with notes.pdf mit 1 Hinweis gespeichert: a note");
+    assert_eq!(message(de(), &saved(path, 2)), "/out/art with notes.pdf mit 2 Hinweisen gespeichert: a note");
+    let c = Catalog::parse("@msgplural\tSaved {path} with {n} note|Saved {path} with {n} notes\tone|other\n");
+    let (_, caps) = c.message_forms("Saved /a with 1 b with 2 notes").expect("matches");
+    assert_eq!(caps, [("path", "/a with 1 b"), ("n", "2")]);
+    assert!(c.message_forms("Saved /a with b notes").is_none());
+    assert_eq!(message(de(), "no brush `with 2`"), "kein Pinsel `with 2`");
 }
 
 /// The scan reads the message of an error made with one of the engine's [`ERROR_HELPERS`] or with
@@ -1543,7 +1909,7 @@ fn width(p: &Value, cmd: &str, key: &str) -> Result<f64> {
 }
 "##;
     let engine: Vec<_> = ERROR_HELPERS.iter().filter(|(c, _, _)| *c == "engine").map(|&(_, call, before)| (call, before)).collect();
-    let found = source_messages(code, &engine);
+    let found = source_messages(code, &engine, &Default::default());
     for want in [
         "`{key}` must be a number",
         "the width can't be negative",
@@ -1562,12 +1928,118 @@ fn width(p: &Value, cmd: &str, key: &str) -> Result<f64> {
     }
     let named = |m: &String| m.contains("not an error") || m.contains("not.an.error") || m.contains("not.a.reason");
     assert!(!found.iter().any(named), "{found:#?}");
-    let elsewhere = source_messages(code, &[]);
+    let elsewhere = source_messages(code, &[], &Default::default());
     let in_variants = ["nested", "manifest", "nothing to clear", "panel is locked"];
     assert!(elsewhere.len() == 4 && elsewhere.iter().all(|m| in_variants.iter().any(|w| m.contains(w))), "{elsewhere:#?}");
     // A message read this way matches its row: `{key}` keeps its name.
     let c = Catalog::parse("@msg\t`{key}` must be a number\t`{key}` ok\n");
     assert_eq!(c.message("`width` must be a number").map(|m| m.1), Some(vec![("key", "width")]));
+}
+
+/// The scan reads a message that an error or a status takes from a `&str` constant, by its name or
+/// by its path, with `.into()`, `.to_string()` or nothing after it, and the constant declared in
+/// another file. It does not read a constant that no error takes, a call of a name that a constant
+/// also has, or a constant in a comment.
+#[test]
+fn message_scan_reads_messages_held_in_constants() {
+    let declared = r#"
+pub(crate) const TOO_LARGE: &str = "the selection is too large to hand over";
+pub const SLOW: &'static str = "time budget";
+const UNUSED: &str = "not an error: a constant no error takes";
+const fn NOT_A_STR() -> u32 { 0 }
+// const COMMENTED: &str = "not an error: a constant in a comment";
+"#;
+    let code = r#"
+fn run() -> Result<()> {
+    let _ = Error::Limit(crate::runtime::TOO_LARGE.into());
+    let _ = Err(Error::Limit(SLOW.to_string()));
+    let _ = Err(COMMENTED);
+    let _ = Err(SLOW(3));
+    Ok(())
+}
+"#;
+    let mut consts = std::collections::BTreeMap::new();
+    for (name, value) in str_consts(declared) {
+        consts.entry(name).or_insert_with(Vec::new).push(value);
+    }
+    assert_eq!(consts.keys().collect::<Vec<_>>(), ["SLOW", "TOO_LARGE", "UNUSED"]);
+    let found: std::collections::BTreeSet<String> = source_messages(code, &[], &consts).into_iter().collect();
+    assert_eq!(found.iter().collect::<Vec<_>>(), ["the selection is too large to hand over", "time budget"]);
+    assert!(source_messages(code, &[], &Default::default()).is_empty());
+}
+
+/// The limits a plug-in run can exceed, and the error of a removal that leaves the plug-in's grant
+/// in the plug-in store, are translated in every language that translates every message, as the
+/// status bar shows them.
+#[test]
+fn plugin_limit_errors_are_translated() {
+    use vectorcraft_plugins::Error;
+    let scanned = message_literals();
+    let grant = "the plug-in's grant can't be removed from the plug-in store";
+    let templates = [
+        "instruction budget",
+        "time budget",
+        "memory budget (the selection is too large to hand over)",
+        "output size ({what} is {len} bytes, limit {max})",
+        grant,
+    ];
+    for template in templates {
+        assert!(scanned.contains(template), "{template}");
+    }
+    let limits = [
+        "instruction budget",
+        "time budget",
+        "memory budget (the selection is too large to hand over)",
+        "output size (the result is 9000 bytes, limit 4096)",
+    ];
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        for limit in limits {
+            let shown = message(lang, limit);
+            assert_ne!(shown, limit, "{code}");
+            let whole = message(lang, &Error::Limit(limit.into()).to_string());
+            assert!(whole.contains(&shown) && !whole.contains("exceeded"), "{code}: {whole}");
+        }
+        let shown = message(lang, limits[3]);
+        assert!(shown.contains("9000") && shown.contains("4096") && !shown.contains("output size"), "{code}: {shown}");
+        assert_ne!(message(lang, grant), grant, "{code}");
+    }
+}
+
+/// The warnings of an Image Trace with keepColors, which the status bar shows and the scan above
+/// doesn't read, are translated in each language of [`COMPLETE_MESSAGES`], with the colors kept.
+#[test]
+fn the_keep_colors_trace_warnings_are_translated() {
+    use serde_json::json;
+    let mut s = vectorcraft_engine::Session::new();
+    s.execute("file.new", &json!({"width": 100, "height": 100})).unwrap();
+    // A white field with a black square in it.
+    let img = image::RgbaImage::from_fn(40, 40, |x, y| {
+        image::Rgba(if (10..30).contains(&x) && (10..30).contains(&y) { [0, 0, 0, 255] } else { [255, 255, 255, 255] })
+    });
+    let mut png = vec![];
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let data = vectorcraft_format::base64_encode(&png);
+    let mut warnings = vec![];
+    for (params, shown) in [
+        (json!({"mode": "color", "palette": "limited", "colors": 2, "keepColors": ["#ff00ff", "#00ffff"]}), "#ff00ff, #00ffff"),
+        (json!({"mode": "color", "palette": "limited", "colors": 2, "keepColors": ["#000000", "#00ffff"]}), "#00ffff"),
+        (json!({"mode": "color", "palette": "limited", "colors": 2, "keepColors": ["#000000"], "ignoreWhite": true, "ignoreColor": "#000000"}), ""),
+        (json!({"mode": "logo", "keepColors": ["#000000"]}), ""),
+    ] {
+        s.execute("file.place", &json!({"name": "square.png", "dataBase64": data, "link": false})).unwrap();
+        let r = s.execute("imageTrace.makeAndExpand", &json!({ "params": params })).unwrap();
+        let w = r["warnings"].as_array().and_then(|w| w.first()).and_then(|w| w.as_str()).unwrap_or_else(|| panic!("{params}: {r}"));
+        warnings.push((w.to_string(), shown));
+    }
+    // Listed colors that were traced and produced no paths (no square image gives that).
+    warnings.push(("Nothing was traced: the colors that match keepColors produce no paths.".to_string(), ""));
+    for (warning, shown) in &warnings {
+        for code in COMPLETE_MESSAGES {
+            let tr = message(Lang::from_code(code).unwrap(), warning);
+            assert!(tr != *warning && tr.contains(shown) && tr.contains("keepColors"), "{code}: {tr}");
+        }
+    }
 }
 
 /// The parameter errors of the blend spine commands (Move Spine Point, Reshape Spine Segment, Add
@@ -1605,6 +2077,12 @@ fn blend_spine_param_errors_say_what_is_wrong() {
         ("object.blend.spine.moveAnchor", json!({"anchor": 0, "x": 1e12, "y": 0}), "x and y must be finite"),
         ("object.blend.spine.moveAnchor", json!({"anchor": 0, "x": 0, "y": 0, "handle": "up"}), "handle must be in or out"),
         ("object.blend.spine.moveAnchor", json!({"anchor": 5, "x": 0, "y": 0}), "no such spine point"),
+        (
+            "object.blend.spine.moveAnchor",
+            json!({"anchor": 0, "x": 0, "y": 0, "with": "1"}),
+            "`with` must be a list of at most 10000 spine point indexes",
+        ),
+        ("object.blend.spine.moveAnchor", json!({"anchor": 0, "x": 0, "y": 0, "with": [1], "handle": "in"}), "`with` moves points, not a handle"),
         ("object.blend.spine.moveAnchor", json!({"id": other, "anchor": 0, "x": 0, "y": 0}), "not a blend"),
         ("object.blend.spine.reshapeSegment", json!({"segment": 0, "dx": 1e12}), "t, dx and dy must be finite"),
         ("object.blend.spine.reshapeSegment", json!({"segment": 5, "dy": 10}), "no such spine segment"),
@@ -1618,6 +2096,80 @@ fn blend_spine_param_errors_say_what_is_wrong() {
     s.execute("select.none", &json!({})).unwrap();
     let e = s.execute("object.blend.spine.moveAnchor", &json!({"anchor": 0, "x": 0, "y": 0})).unwrap_err();
     assert!(matches!(&e, EngineError::BadParams { msg, .. } if msg == "select a blend or give `id`"), "{e}");
+}
+
+/// Import Data Sets' refusal of two header cells that name one variable is translated in every
+/// language that translates every message.
+#[test]
+fn dataset_import_repeated_column_error_is_translated() {
+    use serde_json::json;
+    use vectorcraft_engine::{EngineError, Session};
+    let mut s = Session::new();
+    s.execute("file.new", &json!({})).unwrap();
+    let e = s.execute("dataset.import", &json!({"csv": "City,City\nParis,Rome"})).unwrap_err();
+    let want = "columns 1 and 2 both name the variable `City`";
+    assert!(matches!(&e, EngineError::BadParams { msg, .. } if msg == want), "{e}");
+    let e = e.to_string();
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        let shown = message(lang, &e);
+        assert!(!shown.contains(want), "{code}: {shown}");
+    }
+}
+
+/// The errors of a command's parameter schema are translated in every language that translates
+/// every message, with the parameter's path and the refused value kept.
+#[test]
+fn parameter_schema_errors_are_translated() {
+    use serde_json::json;
+    use vectorcraft_engine::Session;
+    let scanned = message_literals();
+    for template in [
+        "the params must be an object, not {got}",
+        "unknown parameter `{path}`; the object takes no keys",
+        "unknown parameter `{path}`; it takes: {keys}",
+        "missing `{path}`",
+        "`{path}` must be {expected}, not {got}",
+    ] {
+        assert!(scanned.contains(template), "{template}");
+    }
+    let mut s = Session::new();
+    s.execute("file.new", &json!({})).unwrap();
+    let errors = [
+        (s.execute("view.saved.new", &json!({"center": [0, 0], "zoom": -1})).unwrap_err().to_string(), "`zoom`", "must be", "-1"),
+        (s.execute("view.saved.new", &json!({"center": [0, 0]})).unwrap_err().to_string(), "`zoom`", "missing", ""),
+        (s.execute("view.saved.list", &json!(5)).unwrap_err().to_string(), "5", "must be", ""),
+    ];
+    s.execute("view.saved.new", &json!({"name": "A", "center": [0, 0], "zoom": 1})).unwrap();
+    let nested = [
+        (s.execute("view.saved.edit", &json!({"edits": [{"name": "A"}, {"name": "A", "delete": 1}]})).unwrap_err().to_string(), "`edits[1].delete`"),
+        (s.execute("view.saved.edit", &json!({"edits": [{"name": "A", "x": 1}]})).unwrap_err().to_string(), "`edits[0].x`"),
+    ];
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        for (e, kept, english, value) in &errors {
+            let shown = message(lang, e);
+            assert!(shown.contains(kept) && shown.contains(value) && !shown.contains(english), "{code}: {shown}");
+        }
+        for (e, kept) in &nested {
+            let shown = message(lang, e);
+            assert!(shown.contains(kept) && !shown.contains("unknown parameter") && !shown.contains("must be"), "{code}: {shown}");
+        }
+    }
+}
+
+/// The warning for a PDF/X file that leaves out the document's bleed is translated in every catalog,
+/// alone and in the status bar's note.
+#[test]
+fn pdfx_bleed_warning_is_translated() {
+    let w = vectorcraft_engine::cmd::fileio::pdf::BLEED_LEFT_OUT;
+    let status = format!("Saved /tmp/a.pdf with 1 note: {w}");
+    // A catalog's `{a}: {b}` row can translate the colon alone, so the check looks for the English words.
+    for lang in Lang::all().filter(|l| l.code() != Lang::EN.code()) {
+        for shown in [message(lang, w), message(lang, &status)] {
+            assert!(!shown.contains("leaves out") && !shown.contains("turn on"), "{}: {shown}", lang.code());
+        }
+    }
 }
 
 /// The errors of saving, renaming and deleting a tracing preset are translated in every language
@@ -1642,6 +2194,61 @@ fn saved_tracing_preset_errors_are_translated() {
         assert!(matches!(&e, EngineError::BadParams { msg, .. } if msg == want), "{cmd} {p}: {e}");
         errors.push((e.to_string(), want));
     }
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        for (e, want) in &errors {
+            let shown = message(lang, e);
+            assert!(!shown.contains(want), "{code}: {shown}");
+        }
+    }
+}
+
+/// The notes on names in a `.ai`'s editing data that aren't UTF-8 are translated in every language
+/// that translates every message, keeping the name, the encoding and the param.
+#[test]
+fn legacy_name_notes_are_translated() {
+    let notes = [
+        "the name `·¹ÀÌ¾î 1` isn't UTF-8 and was read as windows-1252: if it looks wrong, open the file with another legacyNameEncoding",
+        "the name `레\u{fffd} 1` isn't UTF-8, and parts of it aren't valid windows-949 either: open the file with another legacyNameEncoding",
+        "more names that aren't UTF-8 were read as macintosh (7)",
+    ];
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        for note in notes {
+            let shown = message(lang, note);
+            assert_ne!(shown, note, "{code}");
+            assert!(shown.contains("UTF-8"), "{code}: {shown}");
+        }
+        let shown = message(lang, notes[0]);
+        assert!(shown.contains("`·¹ÀÌ¾î 1`") && shown.contains("windows-1252") && shown.contains("legacyNameEncoding"), "{code}: {shown}");
+        assert!(message(lang, notes[2]).contains("macintosh") && message(lang, notes[2]).contains('7'), "{code}");
+    }
+}
+
+/// Export Data Sets' refusals of more data sets or variables than Import Data Sets reads are
+/// translated in every language that translates every message.
+#[test]
+fn dataset_export_limit_errors_are_translated() {
+    use serde_json::json;
+    use vectorcraft_engine::{EngineError, Session};
+    let mut s = Session::new();
+    s.execute("file.new", &json!({})).unwrap();
+    let rows = "x\n".repeat(1000);
+    s.execute("dataset.import", &json!({"csv": format!("V1\n{rows}")})).unwrap();
+    s.execute("dataset.new", &json!({"name": "Set 1001"})).unwrap();
+    let mut errors = vec![];
+    let e = s.execute("dataset.export", &json!({})).unwrap_err();
+    let want = "more than 1000 data sets: Import Data Sets reads at most 1000";
+    assert!(matches!(&e, EngineError::BadParams { msg, .. } if msg == want), "{e}");
+    errors.push((e.to_string(), want));
+    s.execute("dataset.delete", &json!({"names": ["Set 1001"]})).unwrap();
+    for i in 2..=257 {
+        s.execute("variable.define", &json!({"name": format!("V{i}"), "kind": "text"})).unwrap();
+    }
+    let e = s.execute("dataset.export", &json!({})).unwrap_err();
+    let want = "more than 256 variables: Import Data Sets reads at most 256";
+    assert!(matches!(&e, EngineError::BadParams { msg, .. } if msg == want), "{e}");
+    errors.push((e.to_string(), want));
     for code in COMPLETE_MESSAGES {
         let lang = Lang::from_code(code).expect("registered");
         for (e, want) in &errors {
@@ -1678,11 +2285,39 @@ fn postscript_errors_keep_their_name_and_meaning() {
     }
 }
 
+/// Import Data Sets' errors for a refused cell are translated in every language that translates
+/// every message, with the line and the variable kept.
+#[test]
+fn dataset_import_cell_errors_are_translated() {
+    use serde_json::json;
+    use vectorcraft_engine::{EngineError, Session};
+    let mut s = Session::new();
+    s.execute("file.new", &json!({})).unwrap();
+    s.execute("variable.define", &json!({"name": "Show", "kind": "visibility"})).unwrap();
+    s.execute("variable.define", &json!({"name": "Sales", "kind": "graph"})).unwrap();
+    let mut errors = vec![];
+    for (csv, want) in [
+        ("Show\nmaybe".to_string(), "line 2: value for `Show` must be true or false"),
+        (format!("Sales\n\"{}\"", "1,".repeat(140_000)), "line 2: value for `Sales` is longer than 262144 bytes"),
+    ] {
+        let e = s.execute("dataset.import", &json!({"csv": csv})).unwrap_err();
+        assert!(matches!(&e, EngineError::BadParams { msg, .. } if msg == want), "{e}");
+        errors.push((e.to_string(), want));
+    }
+    for code in COMPLETE_MESSAGES {
+        let lang = Lang::from_code(code).expect("registered");
+        for (e, want) in &errors {
+            let shown = message(lang, e);
+            assert!(!shown.contains(want) && shown.contains('2') && shown.contains('`'), "{code}: {shown}");
+        }
+    }
+}
+
 /// The errors of the parameter checks that many commands share (a number given as text, a missing
 /// number or index, a fraction for a whole number, `ids` that aren't a list of object ids, an
-/// object id that is negative or names no object, a date that isn't Unix seconds) fill their
-/// templates, and each language shows the value in the message, such as a quoted `"60 mm"`, as
-/// given: in its row's translation, or in English where it has none.
+/// `ids` entry or an `id` that is negative, an object id that names no object, a date that isn't
+/// Unix seconds) fill their templates, and each language shows the value in the message, such as a
+/// quoted `"60 mm"`, as given: in its row's translation, or in English where it has none.
 #[test]
 fn shared_param_check_errors_show_their_values_as_given() {
     use serde_json::json;
@@ -1693,7 +2328,7 @@ fn shared_param_check_errors_show_their_values_as_given() {
     s.execute("select.all", &json!({})).unwrap();
     // A command, its params, the English template of its error and the template's values.
     type Case = (&'static str, serde_json::Value, &'static str, &'static [(&'static str, &'static str)]);
-    let cases: [Case; 10] = [
+    let cases: [Case; 11] = [
         ("object.move", json!({"dx": "60 mm"}), "`{key}` must be a number, not {v}", &[("key", "dx"), ("v", r#""60 mm""#)]),
         ("object.rotate", json!({"angle": true}), "`{key}` must be a number, not {v}", &[("key", "angle"), ("v", "true")]),
         ("object.setBounds", json!({"width": [1, 2]}), "`{key}` must be a number, not {v}", &[("key", "width"), ("v", "[1,2]")]),
@@ -1701,7 +2336,13 @@ fn shared_param_check_errors_show_their_values_as_given() {
         ("appearance.setItem", json!({}), "missing integer `{key}`", &[("key", "index")]),
         ("object.transformEach", json!({"reference": 2.5}), "`{key}` must be a whole number", &[("key", "reference")]),
         ("edit.clear", json!({"ids": "all"}), "{key} must be an array of non-negative integer object ids", &[("key", "ids")]),
-        ("edit.clear", json!({"ids": [-1]}), "invalid object id {value}: expected a non-negative integer", &[("value", "-1")]),
+        (
+            "edit.clear",
+            json!({"ids": [-1]}),
+            "`{key}` entry {index} is {value}, not a non-negative integer object id",
+            &[("key", "ids"), ("index", "0"), ("value", "-1")],
+        ),
+        ("paint.invert", json!({"id": -1}), "invalid object id {value}: expected a non-negative integer", &[("value", "-1")]),
         ("edit.clear", json!({"ids": [99999]}), "no such object id {value}", &[("value", "99999")]),
         ("file.new", json!({"created": "yesterday"}), "{key} must be Unix seconds (an integer) or null", &[("key", "created")]),
     ];
@@ -1718,10 +2359,318 @@ fn shared_param_check_errors_show_their_values_as_given() {
     }
 }
 
+/// The spans of `s` between pairs of backticks, such as a parameter key or a command id; none when
+/// its backticks don't pair up.
+fn backticked(s: &str) -> Vec<&str> {
+    let parts: Vec<&str> = s.split('`').collect();
+    if parts.len().is_multiple_of(2) {
+        return Vec::new();
+    }
+    parts.into_iter().skip(1).step_by(2).filter(|t| !t.is_empty()).collect()
+}
+
+#[test]
+fn backticked_finds_the_spans_between_paired_backticks() {
+    assert_eq!(backticked("`ids` must be an array, see `plugin.list`"), ["ids", "plugin.list"]);
+    assert_eq!(backticked("no backticks"), Vec::<&str>::new());
+    assert_eq!(backticked("a lone ` backtick"), Vec::<&str>::new());
+}
+
+/// A translated row keeps each backticked span of its English text, in backticks and as the
+/// English spells it: the span names a parameter key, a command id or a placeholder, which the
+/// command reads as written.
+#[test]
+fn translations_keep_the_backticked_names_of_their_english() {
+    let mut missing = Vec::new();
+    for l in &LANGUAGES {
+        let (entries, _) = parse_entries(l.source);
+        for (ctx, src, tr) in &entries {
+            let plural = ctx == "@plural" || ctx == "@msgplural";
+            let english = if plural { src.rsplit('|').next().unwrap_or(src) } else { src.as_str() };
+            let forms: Vec<&str> = if plural { tr.split('|').collect() } else { vec![tr.as_str()] };
+            for form in forms {
+                for token in backticked(english) {
+                    if !form.contains(&format!("`{token}`")) {
+                        missing.push(format!("{}: `{token}` in {src:?} -> {form:?}", l.code));
+                    }
+                }
+            }
+        }
+    }
+    assert!(missing.is_empty(), "{} rows drop a backticked name:\n{}", missing.len(), missing.join("\n"));
+}
+
+/// The spans of `s` between pairs of straight double quotes outside its backticked spans, such as
+/// a value a parameter takes; none when those quotes don't pair up.
+fn double_quoted(s: &str) -> Vec<&str> {
+    let outside: Vec<&str> = s.split('`').step_by(2).collect();
+    let quotes: usize = outside.iter().map(|part| part.matches('"').count()).sum();
+    if !quotes.is_multiple_of(2) {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let mut open = false;
+    for part in outside {
+        for (i, piece) in part.split('"').enumerate() {
+            if i > 0 {
+                open = !open;
+            }
+            if open && !piece.is_empty() {
+                spans.push(piece);
+            }
+        }
+    }
+    spans
+}
+
+/// Whether `text` holds `word` with no letter or digit right before or after it.
+fn holds_word(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let after = text[at + word.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        before && after
+    })
+}
+
+#[test]
+fn double_quoted_finds_the_spans_between_paired_quotes() {
+    assert_eq!(double_quoted(r#"span must be "object" or "selection", got {v}"#), ["object", "selection"]);
+    assert_eq!(double_quoted(r#"`{"a": 1}` is "left""#), ["left"]);
+    assert_eq!(double_quoted(r#"a lone " quote"#), Vec::<&str>::new());
+    assert!(holds_word("“auto” veya “optical”", "auto"));
+    assert!(!holds_word(r#""content""#, "contents"));
+    assert!(!holds_word(r#""none""#, "one"));
+}
+
+/// A translated status or error message keeps each value its English text puts in double quotes,
+/// spelled as the English spells it, since the value is what a command reads; the quote marks may
+/// be the language's own. Menu and control labels quote names of the interface, which translate.
+#[test]
+fn translated_messages_keep_the_double_quoted_values_of_their_english() {
+    let mut missing = Vec::new();
+    for l in &LANGUAGES {
+        let (entries, _) = parse_entries(l.source);
+        for (ctx, src, tr) in entries.iter().filter(|(ctx, _, _)| ctx == "@msg" || ctx == "@msgplural") {
+            let plural = ctx == "@msgplural";
+            let english = if plural { src.rsplit('|').next().unwrap_or(src) } else { src.as_str() };
+            let forms: Vec<&str> = if plural { tr.split('|').collect() } else { vec![tr.as_str()] };
+            for form in forms {
+                for value in double_quoted(english) {
+                    if !holds_word(form, value) {
+                        missing.push(format!("{}: \"{value}\" in {src:?} -> {form:?}", l.code));
+                    }
+                }
+            }
+        }
+    }
+    assert!(missing.is_empty(), "{} rows drop a double-quoted value:\n{}", missing.len(), missing.join("\n"));
+}
+
+/// Whether `text` holds `word` with no ASCII letter, digit or underscore right before or after it,
+/// so `true` counts in `true이거나` but not in `untrue`.
+fn holds_ascii_word(text: &str, word: &str) -> bool {
+    let joins = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back().is_none_or(|c| !joins(c));
+        let after = text[at + word.len()..].chars().next().is_none_or(|c| !joins(c));
+        before && after
+    })
+}
+
+/// The literal values `true`, `false` and `null` that `s` names outside its backticked and
+/// double-quoted spans.
+fn bare_literals(s: &str) -> Vec<&'static str> {
+    let mut outside = String::new();
+    let mut quoted = false;
+    for part in s.split('`').step_by(2) {
+        for (i, piece) in part.split('"').enumerate() {
+            if i > 0 {
+                quoted = !quoted;
+            }
+            if !quoted {
+                outside.push_str(piece);
+                outside.push(' ');
+            }
+        }
+    }
+    ["true", "false", "null"].into_iter().filter(|lit| holds_ascii_word(&outside, lit)).collect()
+}
+
+#[test]
+fn bare_literals_finds_true_false_and_null_outside_backticks_and_quotes() {
+    assert_eq!(bare_literals("clip must be true or false"), ["true", "false"]);
+    assert_eq!(bare_literals("`leading` must be from 0.1 to 5000, or null for Auto"), ["null"]);
+    assert_eq!(bare_literals(r#"`true` is "false", not untrue"#), Vec::<&str>::new());
+    assert!(holds_ascii_word("true이거나", "true"));
+    assert!(!holds_ascii_word("isTrue or falsey", "false"));
+}
+
+/// A translated status or error message keeps each `true`, `false` and `null` its English text
+/// names without backticks, spelled as the English spells it, since that is the value a command
+/// reads.
+#[test]
+fn translated_messages_keep_the_bare_literals_of_their_english() {
+    let mut missing = Vec::new();
+    for l in &LANGUAGES {
+        let (entries, _) = parse_entries(l.source);
+        for (ctx, src, tr) in entries.iter().filter(|(ctx, _, _)| ctx == "@msg" || ctx == "@msgplural") {
+            let plural = ctx == "@msgplural";
+            let english = if plural { src.rsplit('|').next().unwrap_or(src) } else { src.as_str() };
+            let forms: Vec<&str> = if plural { tr.split('|').collect() } else { vec![tr.as_str()] };
+            for form in forms {
+                for lit in bare_literals(english) {
+                    if !holds_ascii_word(form, lit) {
+                        missing.push(format!("{}: {lit} in {src:?} -> {form:?}", l.code));
+                    }
+                }
+            }
+        }
+    }
+    assert!(missing.is_empty(), "{} rows drop a bare true, false or null:\n{}", missing.len(), missing.join("\n"));
+}
+
+/// Messages that name parameter keys and values without backticks, each with the names a
+/// translation keeps as written in the English.
+const NAMED_KEYS: &[(&str, &[&str])] = &[
+    ("a DXF drawing has one origin: pass useArtboards: true for one drawing per artboard", &["useArtboards"]),
+    ("a name names one asset: give multiple: false, or one object", &["multiple"]),
+    ("a theme is already called {name} (replace: \"{name}\" overwrites it)", &["replace"]),
+    ("action is required", &["action"]),
+    ("anchor must name a registered panel", &["anchor"]),
+    ("antiAlias `{id}`: none, art or type", &["antiAlias", "none", "art", "type"]),
+    ("axis must be \"vertical\", \"horizontal\" or an angle in degrees, not `{v}`", &["axis"]),
+    ("balance must be between 0 and 100", &["balance"]),
+    ("before must name a panel", &["before"]),
+    ("brightness must be dark|mediumDark|mediumLight|light", &["brightness", "dark", "mediumDark", "mediumLight", "light"]),
+    ("clip must be true or false", &["clip"]),
+    ("collapsed must be true or false", &["collapsed"]),
+    ("column must be true or a number from 1", &["column"]),
+    ("column: true floats the whole column and takes no onto, above or below", &["column", "onto", "above", "below"]),
+    ("control must be fillStroke, coloring, drawMode or screenMode", &["control", "fillStroke", "coloring", "drawMode", "screenMode"]),
+    ("decimals must be {_1}–{_2} (got {_3})", &["decimals"]),
+    ("detect must be true or false", &["detect"]),
+    ("give origin: [x, y], or reset: true", &["origin", "reset"]),
+    ("global must be true or false", &["global"]),
+    ("group must be true or false", &["group"]),
+    ("icon must be true or false", &["icon"]),
+    ("included must be true or false", &["included"]),
+    ("index must be a number or first, previous, next or last", &["index", "first", "previous", "next", "last"]),
+    ("index must be a number or first, previous, next or last, not `{other}`", &["index", "first", "previous", "next", "last"]),
+    ("index must be ≥ 0", &["index"]),
+    ("kerning must be a number, \"auto\", or \"optical\"", &["kerning"]),
+    ("lang must be one of {_1}", &["lang"]),
+    ("layers must be true or false", &["layers"]),
+    ("member is for order front, forward, backward or back", &["member", "order", "front", "forward", "backward", "back"]),
+    ("mode is set, add or toggle, not `{other}`", &["mode", "set", "add", "toggle"]),
+    ("names is empty", &["names"]),
+    ("on must be true or false", &["on"]),
+    ("onto must name a floating panel", &["onto"]),
+    ("others must be true or false", &["others"]),
+    ("page must be a whole number from 1", &["page"]),
+    ("panel is not in a dock group", &["panel"]),
+    ("panel must name a registered panel", &["panel"]),
+    ("paths must be strings", &["paths"]),
+    ("percent must be above 0 and at most 6400, not {p}", &["percent"]),
+    ("plane must be left, right or ground", &["plane", "left", "right", "ground"]),
+    ("precision must be from 0.001 to 10 pt", &["precision"]),
+    ("rect is [x, y, width, height] in points", &["rect"]),
+    ("scale must be a number from {_1} to {_2}, not {_3}", &["scale"]),
+    ("scale must be a number from {_1} to {_2}, not {s}", &["scale"]),
+    ("show must be true or false", &["show"]),
+    ("span: \"selection\" places a linear, radial or conic gradient, not a freeform one", &["span"]),
+    ("thickness must be from 0.01 to 5000 pt", &["thickness"]),
+    ("title can't be empty", &["title"]),
+    ("view is required", &["view"]),
+    ("width must be positive", &["width"]),
+    ("zone must be a string", &["zone"]),
+    ("zone must be tab, center, left, right, top or bottom", &["zone", "tab", "center", "left", "right", "top", "bottom"]),
+    ("`dither` applies to gradient fills (stroke: false)", &["stroke"]),
+    ("`strokeMode` applies to strokes (stroke: true)", &["stroke"]),
+];
+
+/// Every catalog's translation of a [`NAMED_KEYS`] message keeps each name the table lists, as
+/// a whole word, and every message in the table is still in a catalog.
+#[test]
+fn translated_messages_keep_the_keys_and_values_their_english_names() {
+    let mut missing = Vec::new();
+    let mut seen = vec![false; NAMED_KEYS.len()];
+    for l in &LANGUAGES {
+        let (entries, _) = parse_entries(l.source);
+        for (_, src, tr) in entries.iter().filter(|(ctx, _, _)| ctx == "@msg") {
+            let Some(at) = NAMED_KEYS.iter().position(|(english, _)| english == src) else { continue };
+            seen[at] = true;
+            for name in NAMED_KEYS[at].1 {
+                if !holds_ascii_word(tr, name) {
+                    missing.push(format!("{}: {name} in {src:?} -> {tr:?}", l.code));
+                }
+            }
+        }
+    }
+    let stale: Vec<&str> = NAMED_KEYS.iter().zip(&seen).filter(|(_, seen)| !**seen).map(|((english, _), _)| *english).collect();
+    assert!(stale.is_empty(), "no catalog translates {stale:?}");
+    assert!(missing.is_empty(), "{} rows drop a key or value their English names:\n{}", missing.len(), missing.join("\n"));
+}
+
+/// The command ids that `s` names outside its backticked spans, such as `assets.list` or
+/// `window.panel.dock`: words of two or more dot-separated parts, each an ASCII letter or digit
+/// run that starts with a lowercase letter.
+fn command_ids(s: &str) -> Vec<&str> {
+    let mut ids = Vec::new();
+    for part in s.split('`').step_by(2) {
+        for word in part.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_')) {
+            let word = word.trim_end_matches('.');
+            let segments: Vec<&str> = word.split('.').collect();
+            let dotted = segments.len() > 1
+                && segments
+                    .iter()
+                    .all(|seg| seg.chars().next().is_some_and(|c| c.is_ascii_lowercase()) && seg.chars().all(|c| c.is_ascii_alphanumeric()));
+            if dotted && word != "e.g" && word != "i.e" {
+                ids.push(word);
+            }
+        }
+    }
+    ids
+}
+
+#[test]
+fn command_ids_finds_dotted_ids_outside_backticks() {
+    assert_eq!(command_ids("no slice {n} in the image (see slice.list)"), ["slice.list"]);
+    assert_eq!(command_ids("use window.panel.dock."), ["window.panel.dock"]);
+    assert_eq!(command_ids("output.destination: {e}"), ["output.destination"]);
+    assert_eq!(command_ids("(assets.list.old देखें)"), ["assets.list.old"]);
+    assert_eq!(command_ids("see `plugin.list`, e.g. 1.5 or {name}.svg"), Vec::<&str>::new());
+}
+
+/// A translated status or error message keeps each command id its English text names without
+/// backticks, spelled as the English spells it, since that is the id a script or the command
+/// palette runs.
+#[test]
+fn translated_messages_keep_the_command_ids_their_english_names() {
+    let mut missing = Vec::new();
+    for l in &LANGUAGES {
+        let (entries, _) = parse_entries(l.source);
+        for (ctx, src, tr) in entries.iter().filter(|(ctx, _, _)| ctx == "@msg" || ctx == "@msgplural") {
+            let plural = ctx == "@msgplural";
+            let english = if plural { src.rsplit('|').next().unwrap_or(src) } else { src.as_str() };
+            let forms: Vec<&str> = if plural { tr.split('|').collect() } else { vec![tr.as_str()] };
+            for form in forms {
+                let kept: Vec<&str> = command_ids(form).into_iter().chain(backticked(form)).collect();
+                for id in command_ids(english) {
+                    if !kept.contains(&id) {
+                        missing.push(format!("{}: {id} in {src:?} -> {form:?}", l.code));
+                    }
+                }
+            }
+        }
+    }
+    assert!(missing.is_empty(), "{} rows drop a command id their English names:\n{}", missing.len(), missing.join("\n"));
+}
+
 /// Languages whose catalogs translate status and error messages; [`untranslated_report`] lists
 /// the messages each one lacks.
-const COMPLETE_MESSAGES: &[&str] =
-    &["cs", "de", "el", "es", "fr", "hu", "it", "ja", "ka", "ko", "pl", "pt-br", "ru", "sv", "uk", "vi", "zh-hans", "zh-hant", "fi", "tr", "ca"];
+const COMPLETE_MESSAGES: &[&str] = &[
+    "cs", "de", "el", "es", "fr", "hi", "hu", "it", "ja", "ka", "ko", "pl", "pt-br", "ru", "sv", "uk", "vi", "zh-hans", "zh-hant", "fi", "tr", "ca",
+];
 
 /// Crates whose error and status messages reach the status bar.
 const MESSAGE_CRATES: &[&str] = &["ui-egui", "engine", "doc", "format", "svg", "pdf", "eps", "text", "plugins", "metafile", "cad", "trace"];
@@ -1752,6 +2701,7 @@ const NOT_MESSAGES: &[&str] = &["quit", "cancelled"];
 pub fn message_literals() -> std::collections::BTreeSet<String> {
     let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut out = std::collections::BTreeSet::new();
+    let mut files = vec![];
     let mut stack: Vec<_> = MESSAGE_CRATES.iter().map(|c| crates.join(c).join("src")).collect();
     while let Some(d) = stack.pop() {
         for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
@@ -1765,13 +2715,51 @@ pub fn message_literals() -> std::collections::BTreeSet<String> {
                 // Control replies are English protocol data, never status-bar messages
                 // (see i18n's module contract). Engine messages are scanned in their own crates.
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let helpers: Vec<_> =
-                    ERROR_HELPERS.iter().filter(|(c, _, _)| path.starts_with(crates.join(c))).map(|&(_, call, before)| (call, before)).collect();
-                out.extend(source_messages(without_test_module(&text), &helpers));
+                files.push((path, text));
             }
         }
     }
+    let mut consts = std::collections::BTreeMap::new();
+    for (_, text) in &files {
+        for (name, value) in str_consts(without_test_module(text)) {
+            consts.entry(name).or_insert_with(Vec::new).push(value);
+        }
+    }
+    for (path, text) in &files {
+        let helpers: Vec<_> =
+            ERROR_HELPERS.iter().filter(|(c, _, _)| path.starts_with(crates.join(c))).map(|&(_, call, before)| (call, before)).collect();
+        out.extend(source_messages(without_test_module(text), &helpers, &consts));
+    }
     out
+}
+
+/// The `&str` constants `code` declares outside its comments (`const NAME: &str = "…";`), with
+/// their text, escapes resolved.
+fn str_consts(code: &str) -> Vec<(String, String)> {
+    let code = &without_comments(code);
+    code.match_indices("const ")
+        .filter(|&(at, _)| !code[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+        .filter_map(|(at, m)| {
+            let rest = &code[at + m.len()..];
+            let (name, rest) = rest.split_at(rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_')?);
+            let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+            let rest = rest.strip_prefix("&'static str").or_else(|| rest.strip_prefix("&str"))?.trim_start();
+            let value = string_literal(rest.strip_prefix('=')?.trim_start().strip_prefix('"')?)?;
+            Some((name.to_string(), value))
+        })
+        .collect()
+}
+
+/// The text of the constant that `rest` starts with, by name or by path (`TIME_BUDGET`,
+/// `crate::runtime::SELECTION_TOO_LARGE.into()`), when `consts` holds it: every text, when crates
+/// declare constants of that name with different texts.
+fn named_const<'a>(rest: &str, consts: &'a std::collections::BTreeMap<String, Vec<String>>) -> &'a [String] {
+    let path = &rest[..rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != ':').unwrap_or(rest.len())];
+    let after = &rest[path.len()..];
+    let used = [")", ",", ".into()", ".to_string()", ".to_owned()"].iter().any(|end| after.starts_with(end));
+    let name = path.rsplit("::").next().unwrap_or("");
+    let upper = name.starts_with(|c: char| c.is_ascii_uppercase()) && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if used && upper { consts.get(name).map_or(&[], Vec::as_slice) } else { &[] }
 }
 
 /// The message literals in `code` outside its comments, as catalog templates (see
@@ -1779,8 +2767,9 @@ pub fn message_literals() -> std::collections::BTreeSet<String> {
 /// error enum's variant (the first, as in `PsError::Limit(…)` and `Error::Manifest(…)`, or the one
 /// [`LATER_MESSAGE_VARIANTS`] gives; not [`NAME_VARIANTS`]),
 /// and the message argument of each call in `helpers` (a call and the number of arguments before
-/// its message), a literal or a `format!` string.
-fn source_messages(code: &str, helpers: &[(&str, usize)]) -> Vec<String> {
+/// its message), a literal, a `format!` string or the name of one of `consts` (see
+/// [`str_consts`]).
+fn source_messages(code: &str, helpers: &[(&str, usize)], consts: &std::collections::BTreeMap<String, Vec<String>>) -> Vec<String> {
     let code = &without_comments(code);
     let after_markers = MESSAGE_MARKERS.iter().flat_map(|marker| code.match_indices(marker).map(|(at, _)| &code[at + marker.len()..]));
     let in_variants = code.match_indices("Error::").filter_map(|(at, m)| {
@@ -1799,10 +2788,15 @@ fn source_messages(code: &str, helpers: &[(&str, usize)]) -> Vec<String> {
     for rest in after_markers.chain(in_variants).chain(in_helpers) {
         let rest = rest.trim_start();
         let rest = rest.strip_prefix("format!(").map_or(rest, str::trim_start);
-        let Some(lit) = rest.strip_prefix('"').and_then(string_literal) else { continue };
-        let has_word = lit.as_bytes().windows(3).any(|w| w.iter().all(u8::is_ascii_lowercase));
-        if has_word && !NOT_MESSAGES.contains(&lit.as_str()) {
-            out.push(as_template(&lit));
+        let lits = match rest.strip_prefix('"') {
+            Some(quoted) => string_literal(quoted).into_iter().collect(),
+            None => named_const(rest, consts).to_vec(),
+        };
+        for lit in lits {
+            let has_word = lit.as_bytes().windows(3).any(|w| w.iter().all(u8::is_ascii_lowercase));
+            if has_word && !NOT_MESSAGES.contains(&lit.as_str()) {
+                out.push(as_template(&lit));
+            }
         }
     }
     out
@@ -1925,6 +2919,7 @@ const RENDER_SITE_ROWS: &[(&str, &str)] = &[
     ("file-filter", "Flattener presets"),
     ("file-filter", "PDF presets"),
     ("file-filter", "Print presets"),
+    ("file-filter", "Export presets"),
     ("file-filter", "SVG Compressed"),
     ("file-filter", "PDF-compatible .ai"),
     ("file-filter", "VectorCraft Template"),
@@ -1967,4 +2962,20 @@ fn polish_plurals_have_three_forms() {
         }
     }
     assert!(count >= 13, "Polish plural rows missing");
+}
+
+/// Every catalog names each numeral system of Character panel menu › Digits, in the `digits`
+/// context (where the language's name would read wrong) or with its plain row (#4942).
+#[test]
+fn every_catalog_names_the_digits_menus_numeral_systems() {
+    let mut missing = Vec::new();
+    for l in LANGUAGES.iter().filter(|l| !l.source.is_empty()) {
+        let cat = l.catalog();
+        for (label, _) in crate::panels::character::DIGITS {
+            if cat.contextual("digits", label).is_none() && cat.plain(label).is_none() {
+                missing.push(format!("{}: {label}", l.code));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "Digits menu labels without a row:\n{}", missing.join("\n"));
 }

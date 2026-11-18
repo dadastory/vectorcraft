@@ -23,6 +23,64 @@ fn increasing_samples_match_single_samples() {
     assert_eq!(g.sample_increasing_with(ts, Color::lerp_keep_model), one_by_one);
 }
 
+/// The prepared sampler gives what sampling each position alone does, out-of-order stops included.
+#[test]
+fn the_sampler_matches_single_samples() {
+    let stop = |offset: f32, hex: &str| GradientStop::new(offset, Color::from_hex(hex).unwrap());
+    let g = Gradient::new(
+        GradientKind::Linear,
+        vec![stop(0.1, "#ff0000"), stop(0.4, "#00ff00"), stop(0.4, "#0000ff"), stop(0.2, "#ffff00"), stop(0.9, "#000000")],
+    );
+    let sample = g.sampler();
+    for k in (0..=40).rev() {
+        let t = k as f32 / 40.0;
+        assert_eq!(sample(t), g.sample(t), "{t}");
+    }
+}
+
+/// Looking stops up by their reach finds what scanning them does, for any order of offsets,
+/// repeated, out-of-order and NaN ones included, and for positions outside and between them.
+#[test]
+fn stop_reach_matches_scanning_the_stops() {
+    let colors = ["#ff0000", "#00ff00", "#0000ff", "#ffff00", "#00ffff", "#000000"];
+    let offsets: [&[f32]; 5] = [
+        &[0.1, 0.4, 0.4, 0.2, 0.9, 0.5],
+        &[0.5, 0.5, 0.5, 0.5],
+        &[0.9, 0.1, 0.8, 0.2, 0.7, 0.3],
+        &[0.2, f32::NAN, 0.6, 0.1, f32::NAN, 1.0],
+        &[f32::NAN, 0.3, 0.3, 0.8],
+    ];
+    for offsets in offsets {
+        let stops: Vec<GradientStop> = offsets
+            .iter()
+            .zip(colors.iter().cycle())
+            .map(|(&o, hex)| GradientStop { midpoint: 0.3, ..GradientStop::new(o, Color::from_hex(hex).unwrap()) })
+            .collect();
+        let g = Gradient::new(GradientKind::Linear, stops);
+        let reach = StopReach::new(&g.stops);
+        for t in (-4..=44).map(|k| k as f32 / 40.0).chain([f32::NAN, f32::INFINITY, f32::NEG_INFINITY]) {
+            // Compared as printed: a NaN offset mixes NaN colours, which are equal only so.
+            let (got, want) = (reach.sample_with(&g.stops, t, &Color::lerp_keep_model), g.sample_with(t, Color::lerp_keep_model));
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{offsets:?} at {t}");
+        }
+    }
+}
+
+/// Repeated offsets turn off the direct midpoint mix, and the midpoints still come out as
+/// `sample` gives them, with work that stays near linear in the stops (thousands of stops at one
+/// offset used to scan them all for each midpoint).
+#[test]
+fn expanded_with_repeated_offsets_samples_midpoints() {
+    let stop = |offset: f32, hex: &str| GradientStop { midpoint: 0.25, ..GradientStop::new(offset, Color::from_hex(hex).unwrap()) };
+    let g = Gradient::new(GradientKind::Linear, vec![stop(0.0, "#ff0000"), stop(0.5, "#00ff00"), stop(0.5, "#0000ff"), stop(1.0, "#000000")]);
+    for (t, c, o, mid) in g.expanded().filter(|e| e.3.is_some()) {
+        assert_eq!(mid, Some(0.25));
+        assert_eq!((c, o), g.sample(t), "midpoint at {t}");
+    }
+    let many = Gradient::new(GradientKind::Linear, (0..200_000).map(|i| stop(if i == 0 { 0.0 } else { 0.5 }, "#808080")).collect());
+    assert_eq!(many.expanded().count(), 2 * 200_000 - 1);
+}
+
 #[test]
 fn midpoint_shifts() {
     let mut g = Gradient::default();
@@ -454,4 +512,371 @@ fn perceptual_gradients_draw_as_pixels() {
         radial.dither = true;
         assert!(GradientPaint::new(radial).draws_as_pixels(fill));
     }
+}
+
+/// A Perceptual gradient of an ink's tints as tints: its stops keep their tints, and each tint on
+/// the curve has the lightness of the color mixed there, so the tints between the stops are not
+/// a straight line.
+#[test]
+fn ink_tints_follow_the_perceptual_curve() {
+    use crate::libraries::srgb_to_oklab;
+    let ink = Color::cmyk(0.0, 1.0, 0.0, 0.0);
+    let mut g = Gradient::new(GradientKind::Linear, vec![GradientStop::new(0.0, ink.tinted(0.8)), GradientStop::new(1.0, Color::WHITE)]);
+    g.method = GradientMethod::Perceptual;
+    assert!(g.fits_ink_tints());
+    let tints = g.ink_tints(&ink, &[]).expect("a magenta ink's tints differ in lightness");
+    assert!(tints.len() > 2, "the curve's stops: {tints:?}");
+    let (first, last) = (tints[0], tints[tints.len() - 1]);
+    assert!((first.0, last.0) == (0.0, 1.0) && (first.1 - 0.8).abs() < 1e-4 && last.1 < 1e-4, "{tints:?}");
+    // The stops' own tints, when given, are kept exactly; the tints in between are the same.
+    let own = g.ink_tints(&ink, &[0.8, 0.0]).expect("tints");
+    assert!(own.len() == tints.len() && own[0].1 == 0.8 && own[own.len() - 1].1 == 0.0, "{own:?}");
+    assert!(own[1..own.len() - 1] == tints[1..tints.len() - 1], "{own:?}");
+    assert!(tints.windows(2).all(|w| w[0].0 <= w[1].0 && w[0].1 >= w[1].1), "in order, lighter along the way: {tints:?}");
+    let lightness = |c: &Color| srgb_to_oklab(c.to_rgb())[0];
+    for (t, tint, _) in &tints {
+        let want = lightness(&g.sample(*t).0);
+        assert!((lightness(&ink.tinted(*tint)) - want).abs() < 1e-3, "at {t}: tint {tint}");
+    }
+    let mid = tints.iter().find(|s| (s.0 - 0.5).abs() < 1e-6).expect("the midpoint");
+    assert!((mid.1 - 0.4).abs() > 0.01, "not halfway in tint: {mid:?}");
+    // A white ink's tints all have paper white's lightness: no tints by lightness.
+    assert_eq!(g.ink_tints(&Color::WHITE, &[]), None);
+    // More stops on the curve than MAX_INK_TINTS: no tints.
+    let n = MAX_INK_TINTS + 1;
+    g.stops = (0..n).map(|i| GradientStop::new(i as f32 / (n - 1) as f32, if i % 2 == 0 { ink } else { Color::WHITE })).collect();
+    assert_eq!(g.ink_tints(&ink, &[]), None);
+    assert!(!g.fits_ink_tints());
+}
+
+/// A Perceptual gradient's curve as mixes of its stops' inks: the stops on the curve at their
+/// offsets, each weighted so the two stops' colors mixed in display RGB have the lightness of
+/// the color on the curve there.
+#[test]
+fn ink_mixes_follow_the_perceptual_curve() {
+    use crate::libraries::srgb_to_oklab;
+    let (magenta, yellow) = (Color::cmyk(0.0, 1.0, 0.0, 0.0), Color::cmyk(0.0, 0.0, 0.6, 0.0));
+    let mut g = Gradient::new(GradientKind::Linear, vec![GradientStop::new(0.0, magenta), GradientStop::new(1.0, yellow)]);
+    g.stops[0].midpoint = 0.3;
+    assert_eq!(g.ink_mixes(), None, "a Classic gradient");
+    g.method = GradientMethod::Perceptual;
+    let mixes = g.ink_mixes().expect("a Perceptual gradient's curve");
+    let curve = g.expanded_stops();
+    assert_eq!(mixes.len(), curve.len(), "a mix for each stop on the curve");
+    assert_eq!((mixes[0], mixes[mixes.len() - 1]), ((0.0, 0, 0.0, 1.0), (1.0, 1, 0.0, 1.0)), "the gradient's own stops");
+    let lightness = |c: &Color| srgb_to_oklab(c.to_rgb())[0];
+    for ((t, i, w, _), (ct, c, _)) in mixes.iter().zip(&curve) {
+        assert!((t - ct).abs() < 1e-6, "{t} on the curve at {ct}");
+        if *i == 0 && *t > 0.0 {
+            let mixed = GradientMethod::Classic.mix(&magenta, &yellow, *w);
+            assert!((lightness(&mixed) - lightness(c)).abs() < 1e-3, "at {t}: weight {w}");
+        }
+    }
+    let mid = mixes.iter().find(|m| (m.0 - 0.3).abs() < 1e-6).expect("the midpoint");
+    assert!((mid.2 - 0.5).abs() > 0.01, "not halfway at the midpoint: {mid:?}");
+    assert!(mixes.windows(2).all(|w| w[0].0 <= w[1].0), "in order: {mixes:?}");
+    // Two colors of one lightness: the weights are the mix positions.
+    g.stops[1].color = magenta;
+    let mixes = g.ink_mixes().expect("the curve");
+    let mid = mixes.iter().find(|m| (m.0 - 0.3).abs() < 1e-6).expect("the midpoint");
+    assert!((mid.2 - 0.5).abs() < 1e-6, "{mid:?}");
+    // More stops on the curve than MAX_INK_TINTS: no mixes.
+    let n = MAX_INK_TINTS + 1;
+    g.stops = (0..n).map(|i| GradientStop::new(i as f32 / (n - 1) as f32, if i % 2 == 0 { magenta } else { Color::WHITE })).collect();
+    assert_eq!(g.ink_mixes(), None);
+}
+
+/// From red to blue the display RGB mix darkens past blue's lightness and comes back, so a
+/// weight found by lightness near the blue stop would be a red-side one and the inks would jump
+/// there. The weights are the mix positions instead, and reach the blue stop's inks steadily.
+#[test]
+fn ink_mixes_use_the_mix_position_when_the_lightness_turns_back() {
+    let (red, blue) = (Color::rgb(1.0, 0.0, 0.0), Color::rgb(0.0, 0.0, 1.0));
+    let mut g = Gradient::new(GradientKind::Linear, vec![GradientStop::new(0.0, red), GradientStop::new(1.0, blue)]);
+    g.method = GradientMethod::Perceptual;
+    let mixes = g.ink_mixes().expect("a Perceptual gradient's curve");
+    assert_eq!(mixes[mixes.len() - 1], (1.0, 1, 0.0, 1.0), "the blue stop");
+    let between: Vec<_> = mixes.iter().filter(|m| m.1 == 0 && m.0 > 0.0).collect();
+    assert!(!between.is_empty(), "stops on the curve between red and blue: {mixes:?}");
+    // With the midpoint at ½, a stop's offset on the curve is its mix position.
+    for (t, _, w, _) in &between {
+        assert!((w - t).abs() < 1e-6, "at {t}: weight {w}");
+    }
+    assert!(mixes.windows(2).filter(|p| p[1].1 == 0).all(|p| p[0].2 <= p[1].2), "the weights rise: {mixes:?}");
+}
+
+fn cmyk_stop(offset: f32, c: f32, m: f32, y: f32, k: f32) -> GradientStop {
+    GradientStop::new(offset, Color::cmyk(c, m, y, k))
+}
+
+/// The `n` × 1 grid of `g` as a left-to-right linear gradient's ink pixels.
+fn ink_row(g: Gradient, n: u16, fill: bool) -> Vec<[u8; 5]> {
+    let b = Rect::new(0.0, 0.0, f64::from(n), 1.0);
+    GradientPaint::new(g).ink_pixels(b, b, n, 1, fill).expect("CMYK stops").collect()
+}
+
+#[test]
+fn ink_pixels_mix_the_stops_inks_in_cmyk() {
+    let mut g = Gradient::new(GradientKind::Linear, vec![cmyk_stop(0.0, 1.0, 0.0, 0.0, 0.0), cmyk_stop(1.0, 0.0, 0.0, 0.0, 1.0)]);
+    g.stops[1].opacity = 0.5;
+    let px = ink_row(g.clone(), 10, true);
+    let at = |x: f32| (x * 255.0).round() as u8;
+    for (i, p) in px.iter().enumerate() {
+        let t = (i as f32 + 0.5) / 10.0;
+        assert_eq!(*p, [at(1.0 - t), 0, 0, at(t), at(1.0 - t * 0.5)], "pixel {i}");
+    }
+    // An off-center midpoint is halfway between the two stops' inks, not a display RGB mix.
+    g.stops[0].midpoint = 0.25;
+    let px = ink_row(g.clone(), 4, false);
+    assert_eq!(&px[0][..4], &[at(0.75), 0, 0, at(0.25)], "halfway to the midpoint");
+    assert_eq!(&px[1][..4], &[at(0.5 * 5.0 / 6.0), 0, 0, at(0.5 + 0.5 / 6.0)], "a sixth of the way past it");
+    // A hard stop keeps both sides.
+    let hard = Gradient::new(
+        GradientKind::Linear,
+        vec![
+            cmyk_stop(0.0, 1.0, 0.0, 0.0, 0.0),
+            cmyk_stop(0.5, 1.0, 0.0, 0.0, 0.0),
+            cmyk_stop(0.5, 0.0, 1.0, 0.0, 0.0),
+            cmyk_stop(1.0, 0.0, 1.0, 0.0, 0.0),
+        ],
+    );
+    let px = ink_row(hard, 4, false);
+    assert_eq!((&px[1][..4], &px[2][..4]), (&[255, 0, 0, 0][..], &[0, 255, 0, 0][..]));
+}
+
+#[test]
+fn ink_pixels_dither_only_the_inks_the_ramp_has() {
+    let mut g = Gradient::new(GradientKind::Linear, vec![cmyk_stop(0.0, 0.2, 0.0, 0.0, 0.4), cmyk_stop(1.0, 0.8, 0.0, 0.0, 0.4)]);
+    g.dither = true;
+    let noisy = ink_row(g.clone(), 64, true);
+    let plain = ink_row(g.clone(), 64, false);
+    assert_ne!(noisy, plain, "a fill has noise, a stroke none");
+    for (n, p) in noisy.iter().zip(&plain) {
+        assert_eq!((n[1], n[2]), (0, 0), "no ink on the empty plates: {n:?}");
+        assert!(n[0].abs_diff(p[0]) <= 1 && n[3].abs_diff(p[3]) <= 1, "{n:?} {p:?}");
+        assert_eq!(n[4], 255, "opacity has no noise");
+    }
+    assert!(noisy.iter().zip(&plain).any(|(n, p)| n[3] != p[3]), "K gets its own noise");
+    assert!(noisy.iter().zip(&plain).any(|(n, p)| (n[0] != p[0]) != (n[3] != p[3])), "the noise differs from channel to channel");
+}
+
+#[test]
+fn ink_pixels_follow_the_perceptual_curve_as_ink_mixes() {
+    let mut g = Gradient::new(GradientKind::Linear, vec![cmyk_stop(0.0, 0.0, 0.0, 0.0, 0.0), cmyk_stop(1.0, 1.0, 0.0, 0.0, 0.0)]);
+    g.method = GradientMethod::Perceptual;
+    let mixes = g.ink_mixes().unwrap();
+    let ramp = g.ink_ramp().unwrap();
+    assert_eq!(ramp.stops.len(), mixes.len());
+    for ((t, ink), (o, i, w, _)) in ramp.stops.iter().zip(&mixes) {
+        assert_eq!((*t, ink[0]), (*o, if *i == 0 { *w } else { 1.0 }), "cyan at {t}");
+    }
+    let px = ink_row(g, 2, false);
+    assert!(px[0][0] > 0 && px[0][0] < px[1][0], "{px:?}");
+    assert!(px.iter().all(|p| p[1] == 0 && p[2] == 0 && p[3] == 0), "{px:?}");
+}
+
+#[test]
+fn ink_pixels_need_every_stop_in_cmyk() {
+    let b = Rect::new(0.0, 0.0, 2.0, 1.0);
+    let with = |stop: GradientStop| GradientPaint::new(Gradient::new(GradientKind::Linear, vec![cmyk_stop(0.0, 1.0, 0.0, 0.0, 0.0), stop]));
+    assert!(with(cmyk_stop(1.0, 0.0, 0.0, 0.0, 1.0)).ink_pixels(b, b, 2, 1, true).is_some());
+    for other in [Color::rgb(1.0, 0.0, 0.0), Color::gray(0.5), Color::lab(50.0, 10.0, 10.0)] {
+        assert!(with(GradientStop::new(1.0, other)).ink_pixels(b, b, 2, 1, true).is_none(), "{other:?}");
+    }
+    assert!(GradientPaint::new(Gradient::new(GradientKind::Linear, vec![])).ink_pixels(b, b, 2, 1, true).is_none(), "no stops");
+}
+
+/// A Perceptual curve over the limit of [`Gradient::ink_mixes`] has no inks; a Classic gradient of as many stops does.
+#[test]
+fn ink_pixels_stop_at_the_ink_mixes_limit() {
+    let stops: Vec<_> = (0..=MAX_INK_TINTS).map(|i| cmyk_stop(i as f32 / MAX_INK_TINTS as f32, (i % 2) as f32, 0.0, 0.0, 0.0)).collect();
+    let classic = Gradient::new(GradientKind::Linear, stops);
+    let perceptual = Gradient { method: GradientMethod::Perceptual, ..classic.clone() };
+    assert!(!perceptual.fits_ink_tints());
+    let b = Rect::new(0.0, 0.0, 2.0, 1.0);
+    assert!(GradientPaint::new(perceptual).ink_pixels(b, b, 2, 1, false).is_none());
+    assert!(GradientPaint::new(classic).ink_pixels(b, b, 2, 1, false).is_some());
+}
+
+/// A conic placed at `center` with its vector `dx` long to the right and aspect `aspect`.
+fn conic_at(center: Point, dx: f64, aspect: f64) -> GradientGeom {
+    GradientGeom { start: center, end: center + Vec2::new(dx, 0.0), aspect, focal: None }
+}
+
+#[test]
+fn a_conic_turns_clockwise_on_the_page_from_its_vector() {
+    // The page's y runs down: a quarter turn clockwise from a vector pointing right is straight
+    // below the center.
+    let g = conic_at(Point::new(100.0, 100.0), 50.0, 1.0);
+    let t = |x: f64, y: f64| g.param_at(GradientKind::Conic, Point::new(x, y));
+    assert!(t(200.0, 100.0).abs() < 1e-12);
+    assert!((t(100.0, 130.0) - 0.25).abs() < 1e-12);
+    assert!((t(10.0, 100.0) - 0.5).abs() < 1e-12);
+    assert!((t(100.0, 3.0) - 0.75).abs() < 1e-12);
+    // Either side of the seam: the start of the ramp just below the vector, its end just above.
+    assert!(t(200.0, 100.01) < 1e-3);
+    let before = t(200.0, 99.99);
+    assert!(before > 0.999 && before <= 1.0, "{before}");
+    // A flatter extent ellipse turns faster near the vector's line: half as tall, the point 1/8
+    // of a turn around is half as far below it.
+    let squashed = conic_at(Point::new(100.0, 100.0), 50.0, 0.5);
+    let p = Point::new(150.0, 125.0);
+    assert!((squashed.param_at(GradientKind::Conic, p) - 0.125).abs() < 1e-12);
+    assert!(g.param_at(GradientKind::Conic, p) < 0.1);
+    // Mirrored (a negative aspect), it turns counterclockwise.
+    let mirrored = conic_at(Point::new(100.0, 100.0), 50.0, -1.0);
+    assert!(mirrored.is_mirrored() && !g.is_mirrored());
+    assert!((mirrored.param_at(GradientKind::Conic, Point::new(100.0, 70.0)) - 0.25).abs() < 1e-12);
+}
+
+#[test]
+fn a_conic_follows_moves_turns_scales_and_mirrors() {
+    let c = Point::new(10.0, 20.0);
+    let g0 = conic_at(c, 30.0, 1.0);
+    let probes = [c + Vec2::new(5.0, 7.0), c + Vec2::new(-9.0, 2.0), c + Vec2::new(3.0, -11.0)];
+    for a in [
+        Affine::rotate(0.7),
+        Affine::scale(2.5),
+        Affine::translate((4.0, -9.0)) * Affine::rotate(-2.0),
+        Affine::FLIP_X,
+        Affine::FLIP_Y * Affine::rotate(1.1),
+        Affine::scale_non_uniform(2.0, 0.5),
+    ] {
+        let mut g = g0;
+        g.transform(a, GradientKind::Conic);
+        assert!(g.start.distance(a * c) < 1e-9, "{a:?}");
+        for p in probes {
+            let (want, got) = (g0.param_at(GradientKind::Conic, p), g.param_at(GradientKind::Conic, a * p));
+            assert!((want - got).abs() < 1e-9, "{a:?} at {p:?}: {want} vs {got}");
+        }
+    }
+    // A mirror and a mirror back: the same sweep.
+    let mut g = g0;
+    g.transform(Affine::FLIP_X, GradientKind::Conic);
+    assert!(g.is_mirrored());
+    g.transform(Affine::FLIP_X, GradientKind::Conic);
+    assert!(!g.is_mirrored() && (g.aspect - 1.0).abs() < 1e-12);
+    // A conic without a vector, or with a flat extent, turns the other way under a mirror too.
+    for flat in [conic_at(c, 0.0, 1.0), conic_at(c, 30.0, 0.0)] {
+        let mut g = flat;
+        g.transform(Affine::FLIP_Y, GradientKind::Conic);
+        assert!(g.is_mirrored(), "{g:?}");
+        g.transform(Affine::rotate(0.3), GradientKind::Conic);
+        assert!(g.is_mirrored(), "{g:?}");
+        g.transform(Affine::FLIP_X, GradientKind::Conic);
+        assert!(!g.is_mirrored(), "{g:?}");
+    }
+    // Under a shear the seam stays where the vector maps.
+    let shear = Affine::new([1.0, 0.0, 0.6, 1.0, 0.0, 0.0]);
+    let mut g = g0;
+    g.transform(shear, GradientKind::Conic);
+    let on_seam = shear * (c + Vec2::new(20.0, 0.0));
+    assert!(g.param_at(GradientKind::Conic, on_seam) < 1e-9, "{g:?}");
+}
+
+#[test]
+fn conic_kind_names_and_fit() {
+    for s in ["conic", "Conic", "angle", "CONICAL"] {
+        assert_eq!(GradientKind::parse(s), Some(GradientKind::Conic), "{s}");
+    }
+    assert_eq!(GradientKind::parse("spiral"), None);
+    assert_eq!(GradientKind::Conic.label(), "Conic");
+    assert!(GradientKind::Conic.is_centered() && GradientKind::Radial.is_centered() && !GradientKind::Linear.is_centered());
+    let fit = GradientGeom::fit(GradientKind::Conic, Rect::new(0.0, 0.0, 200.0, 100.0), 90.0);
+    assert_eq!(fit.start, Point::new(100.0, 50.0));
+    assert!(fit.end.distance(Point::new(100.0, -50.0)) < 1e-9);
+}
+
+/// Is `p` inside polygon `poly` (non-zero winding)?
+fn inside(poly: &[Point], p: Point) -> bool {
+    let mut w = 0i32;
+    for (i, &a) in poly.iter().enumerate() {
+        let c = poly[(i + 1) % poly.len()];
+        let cross = (c - a).cross(p - a);
+        if a.y <= p.y && c.y > p.y && cross > 0.0 {
+            w += 1;
+        } else if a.y > p.y && c.y <= p.y && cross < 0.0 {
+            w -= 1;
+        }
+    }
+    w != 0
+}
+
+#[test]
+fn conic_wedges_cover_the_box_and_meet_at_the_seam() {
+    let b = Rect::new(0.0, 0.0, 200.0, 100.0);
+    let g = conic_at(Point::new(60.0, 40.0), 30.0, 0.5);
+    let wedges = g.conic_wedges(b, 36, false);
+    assert_eq!(wedges.len(), 36);
+    // Each point of the box lies in the wedge whose share of the turn holds it.
+    for (x, y) in [(1.0, 1.0), (199.0, 99.0), (150.0, 30.0), (10.0, 90.0), (61.0, 39.0), (59.0, 41.0)] {
+        let p = Point::new(x, y);
+        let t = g.param_at(GradientKind::Conic, p);
+        let k = ((t * 36.0).floor() as usize).min(35);
+        assert!(inside(&wedges[k].0, p), "({x}, {y}) at {t} is not in wedge {k}");
+        assert!((wedges[k].1 - (k as f64 + 0.5) / 36.0).abs() < 1e-12);
+    }
+    // Overlapping wedges run on from their own start to the seam.
+    let over = g.conic_wedges(b, 36, true);
+    let frame = g.unit_frame().unwrap();
+    let on = |turn: f64| frame * Point::new(0.5 * (turn * std::f64::consts::TAU).cos(), 0.5 * (turn * std::f64::consts::TAU).sin());
+    assert!(inside(&over[0].0, on(0.5)) && inside(&over[0].0, on(35.9 / 36.0)));
+    assert!(inside(&over[20].0, on(35.9 / 36.0)) && !inside(&over[20].0, on(19.9 / 36.0)));
+    // The count is kept to what a file can hold.
+    assert_eq!(g.conic_wedges(b, 0, false).len(), 1);
+    assert_eq!(g.conic_wedges(b, usize::MAX, false).len(), MAX_CONIC_WEDGES);
+}
+
+/// A conic whose extent can't be drawn (a vector without length, an aspect of 0, or numbers out
+/// of range, as a file can hold them) sweeps from the right about its start, or the origin; the
+/// parameter, the frame and the wedges stay finite.
+#[test]
+fn a_conic_with_no_extent_or_bad_numbers_still_sweeps() {
+    let c = Point::new(50.0, 50.0);
+    for g in [
+        conic_at(c, 0.0, 1.0),
+        conic_at(c, 30.0, 0.0),
+        conic_at(c, 30.0, f64::NAN),
+        conic_at(c, 30.0, f64::INFINITY),
+        conic_at(c, f64::INFINITY, 1.0),
+        GradientGeom { end: Point::new(f64::NAN, 3.0), ..conic_at(c, 30.0, 1.0) },
+    ] {
+        assert!(g.conic_frame().as_coeffs().iter().all(|v| v.is_finite()), "{g:?}");
+        let t = |x: f64, y: f64| g.param_at(GradientKind::Conic, Point::new(x, y));
+        assert!(t(90.0, 50.0).abs() < 1e-12, "{g:?}");
+        assert!((t(50.0, 90.0) - 0.25).abs() < 1e-12, "{g:?}");
+        let wedges = g.conic_wedges(Rect::new(0.0, 0.0, 100.0, 100.0), 4, false);
+        assert!(wedges.iter().flat_map(|(pts, _)| pts).all(|p| p.is_finite()), "{g:?}");
+    }
+    // A flat extent keeps the vector's direction and the sign of its aspect.
+    let down = GradientGeom { end: Point::new(50.0, 80.0), ..conic_at(c, 30.0, 0.0) };
+    assert!(down.param_at(GradientKind::Conic, Point::new(50.0, 90.0)).abs() < 1e-12);
+    assert!((down.param_at(GradientKind::Conic, Point::new(10.0, 50.0)) - 0.25).abs() < 1e-12);
+    for g in [conic_at(c, 0.0, -1.0), conic_at(c, 30.0, -0.0), conic_at(c, 30.0, f64::NEG_INFINITY)] {
+        assert!(g.is_mirrored(), "{g:?}");
+        assert!((g.param_at(GradientKind::Conic, Point::new(50.0, 10.0)) - 0.25).abs() < 1e-12, "{g:?}");
+    }
+    let lost = GradientGeom { start: Point::new(f64::NAN, 0.0), ..conic_at(c, 30.0, 1.0) };
+    assert_eq!(lost.conic_frame(), Affine::IDENTITY);
+    for p in [Point::new(3.0, 4.0), Point::new(f64::NAN, 1.0), Point::new(f64::INFINITY, 0.0)] {
+        let t = lost.param_at(GradientKind::Conic, p);
+        assert!((0.0..=1.0).contains(&t), "{t}");
+    }
+}
+
+/// A conic's pixels (what SVG and PDF draw a dithered or Perceptual one as) follow the sweep,
+/// with one stop as well as many.
+#[test]
+fn conic_pixels_follow_the_sweep() {
+    let b = Rect::new(0.0, 0.0, 4.0, 4.0);
+    let mut g = GradientPaint::new(Gradient::new(GradientKind::Conic, Gradient::default().stops));
+    g.geom = Some(conic_at(Point::new(2.0, 2.0), 1.0, 1.0));
+    let px: Vec<[u8; 4]> = g.pixels(b, b, 4, 4, true, &Color::to_rgb).collect();
+    // Below right of the center, early in the sweep: light. Above right, late: dark.
+    assert!(px[3 * 4 + 3][0] > 180 && px[3][0] < 75, "{px:?}");
+    let one = GradientPaint { gradient: Gradient::new(GradientKind::Conic, vec![GradientStop::new(0.3, Color::rgb(1.0, 0.0, 0.0))]), ..g.clone() };
+    assert!(one.pixels(b, b, 4, 4, true, &Color::to_rgb).all(|p| p == [255, 0, 0, 255]));
+    let many = (0..=1000).map(|i| GradientStop::new(i as f32 / 1000.0, Color::gray((i % 2) as f32))).collect();
+    let many = GradientPaint { gradient: Gradient::new(GradientKind::Conic, many), ..g };
+    assert_eq!(many.pixels(b, b, 4, 4, true, &Color::to_rgb).count(), 16);
 }
